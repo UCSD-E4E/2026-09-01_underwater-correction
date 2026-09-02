@@ -304,6 +304,20 @@ class DecodeConfig:
     #: permanently near zero and the boost does nothing.
     red_boost_span: float = 0.05
 
+    #: Optional denoise, applied to the linear decode before the auto-gamma
+    #: lift ("pre") or at the end of the chain ("post"). "off" is production.
+    #:
+    #: Kept opt-in rather than folded into the recommendation because it is a
+    #: real trade, not a free win: on these frames the fish's scale texture
+    #: measures only ~1.6x the open-water grain *in the same frequency band*,
+    #: so any single-frame filter strong enough to remove the grain takes most
+    #: of the texture with it. That is an information limit, not a tuning
+    #: failure, and it is why the choice belongs to whoever is looking at the
+    #: frames rather than to a default.
+    denoise: str = "off"
+    #: Strength for the total-variation denoiser.
+    denoise_weight: float = 0.02
+
     #: Percentile for WHITE_PATCH and SLATE gain estimation.
     wb_percentile: float = 99.0
 
@@ -352,6 +366,10 @@ class DecodeConfig:
                 )
         if self.red_boost < 0:
             raise ValueError(f"red_boost must be >= 0, got {self.red_boost}")
+        if self.denoise not in ("off", "tv-pre", "tv-post"):
+            raise ValueError(
+                f"denoise must be 'off', 'tv-pre' or 'tv-post', got {self.denoise!r}"
+            )
         if self.red_boost_sigmas < 0:
             raise ValueError(
                 f"red_boost_sigmas must be >= 0, got {self.red_boost_sigmas}"
@@ -379,6 +397,8 @@ class DecodeConfig:
             parts.append(
                 f"stretch{self.stretch_mode[0]}{fmt(self.stretch_low)}-{fmt(self.stretch_high)}"
             )
+        if self.denoise != "off":
+            parts.append(f"{self.denoise}{self.denoise_weight:g}")
         if self.red_boost:
             parts.append(
                 f"redboost{self.red_boost:g}"

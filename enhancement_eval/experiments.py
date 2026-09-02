@@ -121,8 +121,36 @@ def _clahe_arms() -> list[Arm]:
 
 _JPEG_CONSUMERS = ("fish segmentation", "head/tail", "slate estimator", "human labelers")
 
+def _recommended_arms() -> list[Arm]:
+    """The configurations this work converged on, as trial arms."""
+    from enhancement_eval.recommended import (
+        GENTLE_DENOISE,
+        PRODUCTION,
+        RECOMMENDED,
+        RECOMMENDED_WITH_DOT,
+    )
+
+    stage = Stage.RECTIFIED
+    return [
+        Arm("baseline", stage, decode=PRODUCTION),
+        Arm("recommended", stage, decode=RECOMMENDED),
+        Arm("recommended-dot", stage, decode=RECOMMENDED_WITH_DOT),
+        Arm("gentle-denoise", stage, decode=GENTLE_DENOISE),
+    ]
+
+
 EXPERIMENTS: dict[str, Experiment] = {
     # ---------------- shipping candidates: JPEG stage only ----------------
+    "recommended": Experiment(
+        build=_recommended_arms,
+        consumers=_JPEG_CONSUMERS,
+        note=(
+            "The configurations this work converged on, against the current "
+            "decode. Nothing here is deployed; these are the arms a labeling "
+            "trial would run. `python -m enhancement_eval recommend` prints "
+            "what each one changes and what it deliberately does not."
+        ),
+    ),
     "wb-jpeg": Experiment(
         build=lambda: _wb_arms(Stage.RECTIFIED),
         consumers=_JPEG_CONSUMERS,

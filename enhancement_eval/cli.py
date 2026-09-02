@@ -588,6 +588,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     f.set_defaults(func=cmd_effort)
 
+    rec = sub.add_parser(
+        "recommend", help="print the recommended configurations and what settles them"
+    )
+    rec.set_defaults(func=lambda _a: (print(__import__(
+        "enhancement_eval.recommended", fromlist=["describe"]).describe()), 0)[1])
+
     r = sub.add_parser("report", help="summarize a results CSV")
     r.add_argument("--results", default="results.csv")
     r.add_argument("--pool-dive", action="append", help="force a dive to pool")

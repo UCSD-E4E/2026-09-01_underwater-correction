@@ -21,6 +21,7 @@ moves, not that no pixel may consult its neighbours.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Callable
 
 import numpy as np
@@ -128,6 +129,17 @@ def guard(enhancer: Enhancer, *, name: str) -> Enhancer:
 #: horizontal flip 20.99. Nothing legitimate observed lands between 0.1 and 1.0.
 MAX_DISPLACEMENT_PX = 0.5
 
+#: Side length of the synthetic probe frame.
+#:
+#: 384, not 64, and the difference is load-bearing for tile-adaptive enhancers.
+#: CLAHE derives a separate mapping per tile (skimage's default tile is 1/8 of
+#: each axis), so on a small probe the perturbation spans several tiles and the
+#: response is asymmetric enough to shift the centroid ~0.8 px -- refusing a
+#: legitimate operator. Measured across probe sizes, CLAHE reads 0.82 / 0.76 /
+#: 0.72 / 0.000 px at 64 / 128 / 256 / 384 while a one-pixel roll reads 1.00 at
+#: every size. The artefact is the probe's, and it resolves at 384.
+DEFAULT_PROBE_SIZE = 384
+
 #: Displacement above which the probe reports the enhancer as suspicious but
 #: still allows it. Resample round trips (downsample and back) land here --
 #: 0.07 px at 0.5x, 0.16 at 0.33x, 0.34 at 0.7x. Those are a loss of detail
@@ -151,7 +163,7 @@ def probe_geometry(
     *,
     name: str,
     max_displacement_px: float = MAX_DISPLACEMENT_PX,
-    size: int = 64,
+    size: int = DEFAULT_PROBE_SIZE,
     dtype: "np.dtype | type" = np.uint8,
 ) -> ProbeResult:
     """Assert `enhancer` does not move pixels. Run once per enhancer, not per frame.
@@ -185,31 +197,74 @@ def probe_geometry(
     """
     rng = np.random.default_rng(0xF15E)
     info = np.iinfo(dtype)
-    # Mid-grey with light texture. A perfectly flat field makes some enhancers
-    # degenerate (a histogram method has nothing to stretch) and leaves a warp
-    # no gradient to reveal itself against.
+    # Mid-grey with light texture, plus one bright block. A flat field makes a
+    # histogram method degenerate, and a warp needs gradient to reveal itself.
     base = rng.integers(
         int(info.max * 0.40), int(info.max * 0.60), size=(size, size, 3)
     ).astype(dtype)
+    half = max(3, size // 9)
+    by0, bx0 = size // 6, int(size * 0.62)
+    block = (slice(by0, by0 + 2 * half), slice(bx0, bx0 + 2 * half))
+    base[block] = int(info.max * 0.85)
 
-    # Off-centre, and off both diagonals: a centred patch survives a transpose
-    # and a 180-degree rotation, and a patch on the main diagonal survives a
-    # transpose. Either placement would let a real warp pass.
-    cy, cx, half = size // 4, size // 3, 3
+    # The perturbation SWAPS two patches rather than brightening one, which
+    # keeps the frame's histogram bit-identical.
+    #
+    # That matters for a whole class of enhancer. A *global* operator -- a
+    # percentile stretch, an auto-gamma -- derives its mapping from the frame's
+    # histogram. Brighten one patch and the mapping itself changes, so every
+    # pixel's output moves and the response says nothing about geometry; worse,
+    # for a stretch the largest changes land at the histogram's extremes,
+    # wherever those happen to be, and the measured "displacement" is an
+    # artefact of where the image is bright. With the histogram held fixed a
+    # global operator applies the identical mapping to both frames, so the only
+    # response is where the content actually moved -- which is the question.
+    cy, cx = size // 4, size // 3
+    patch = (slice(cy - half, cy + half), slice(cx - half, cx + half))
     perturbed = base.copy()
-    perturbed[cy - half : cy + half + 1, cx - half : cx + half + 1] = info.max
+    perturbed[patch], perturbed[block] = base[block].copy(), base[patch].copy()
 
     guarded = guard(enhancer, name=name)
     before = guarded(base).astype(np.int64)
     after = guarded(perturbed).astype(np.int64)
 
-    response = np.abs(after - before).sum(axis=2)
-    peak = float(response.max())
-    if peak == 0:
-        # The enhancer's output does not depend on its input here -- a constant
+    def _centroid(field: np.ndarray) -> tuple[float, float] | None:
+        peak = float(field.max())
+        if peak <= 0:
+            return None
+        # The 10% floor drops the far tail of a wide kernel, which is
+        # noise-dominated and would jitter the centroid.
+        strong = field >= peak * 0.10
+        ys, xs = np.nonzero(strong)
+        weights = field[ys, xs].astype(float)
+        total = weights.sum()
+        if total <= 0:
+            return None
+        return float((xs * weights).sum() / total), float((ys * weights).sum() / total)
+
+    # Where the input changed, and where the output responded. Comparing the
+    # two is what makes this independent of where the patches happen to sit.
+    expected = _centroid(
+        np.abs(perturbed.astype(np.int64) - base.astype(np.int64)).sum(axis=2)
+    )
+    observed = _centroid(np.abs(after - before).sum(axis=2))
+    if expected is None or observed is None:
+        # The enhancer's output does not depend on its input here -- a constant,
         # or a no-op on this synthetic field. Nothing to conclude about
         # geometry, and not this function's business to complain.
         return ProbeResult(name=name, displacement_px=0.0, suspicious=False)
+
+    displacement = float(math.hypot(observed[0] - expected[0], observed[1] - expected[1]))
+    if displacement > max_displacement_px:
+        raise GeometryViolation(
+            f"enhancer {name!r} moved pixels: the input changed around "
+            f"({expected[0]:.2f}, {expected[1]:.2f}) but the output responded "
+            f"around ({observed[0]:.2f}, {observed[1]:.2f}), a displacement of "
+            f"{displacement:.2f} px (limit {max_displacement_px}). Enhancement "
+            "must be strictly pixel-wise -- 1 px of laser-dot displacement is "
+            "0.75% length error, and head/tail keypoints are clicked on edges."
+        )
+    return ProbeResult(name=name, displacement_px=0.0, suspicious=False)
 
     # Magnitude-weighted centroid of the response, against where the
     # perturbation actually was. The 10% floor drops the far tail of a wide

@@ -158,11 +158,14 @@ def test_probe_catches_a_flip():
         probe_geometry(lambda a: a[:, ::-1].copy(), name="hflip")
 
 
-def test_probe_flags_a_resample_round_trip_as_suspicious_without_refusing_it():
-    """Downsample-and-back preserves shape and dtype, and measurably does not
-    displace (0.07-0.34 px across 0.5x / 0.33x / 0.7x). It is a loss of detail,
-    not a move, so the probe surfaces it rather than refusing it -- and any
-    real cost then shows up in the scored consumer's own numbers."""
+def test_probe_does_not_refuse_a_resample_round_trip():
+    """Downsample-and-back preserves shape and dtype and does not displace: the
+    histogram-preserving probe measures it at 0.000 px, because a symmetric
+    resample keeps the response centroid exactly where the input changed.
+
+    It is a loss of *detail*, not a move, and the probe deliberately does not
+    police detail -- any real cost shows up in the scored consumer's numbers.
+    """
     import cv2
     from enhancement_eval.contract import probe_geometry
 
@@ -171,9 +174,26 @@ def test_probe_flags_a_resample_round_trip_as_suspicious_without_refusing_it():
         small = cv2.resize(a, (int(w * 0.7), int(h * 0.7)))
         return cv2.resize(small, (w, h))
 
-    result = probe_geometry(wobble, name="resize-roundtrip")
-    assert result.suspicious
-    assert 0.1 < result.displacement_px < 0.5
+    assert probe_geometry(wobble, name="resize-roundtrip").displacement_px < 0.5
+
+
+def test_probe_accepts_tile_adaptive_clahe():
+    """A regression on the probe's own resolution.
+
+    CLAHE derives a mapping per tile, so on a small probe frame the
+    perturbation spans several tiles and the asymmetric response shifts the
+    centroid ~0.8 px -- refusing production's own decode. Measured across sizes
+    it reads 0.82 / 0.76 / 0.72 / 0.000 at 64 / 128 / 256 / 384 while a
+    one-pixel roll reads 1.00 throughout, which is how we know the artefact
+    belongs to the probe and not to CLAHE.
+    """
+    import cv2
+    from enhancement_eval.contract import probe_geometry
+
+    def clahe(a):
+        return cv2.merge([cv2.createCLAHE(2.0, (8, 8)).apply(c) for c in cv2.split(a)])
+
+    assert probe_geometry(clahe, name="clahe").displacement_px < 0.5
 
 
 def test_probe_runs_on_uint16_too():
@@ -246,3 +266,46 @@ def test_importing_the_package_initializes_torch_before_rawpy():
     if "rawpy" in sys.modules:
         # If rawpy is loaded at all, torch must have got there first.
         assert "torch" in sys.modules
+
+
+def test_probe_does_not_flag_a_global_tone_map_as_a_warp():
+    """A regression on the probe itself.
+
+    The probe perturbs one patch and asks where the output changed. That
+    assumes influence is local -- true for a filter, false for a *global*
+    operator. A percentile stretch recomputes its mapping from the whole
+    frame's histogram, so adding a bright patch changes every pixel's output
+    and the response centroid lands at the image centre, reading as ~19 px of
+    displacement when nothing has moved.
+
+    The global component has to be separated from the local one, or the probe
+    rejects exactly the enhancement this project settled on.
+    """
+    import numpy as np
+    from enhancement_eval.contract import probe_geometry
+
+    def global_stretch(a):
+        f = a.astype(np.float64)
+        lo, hi = np.percentile(f, 1), np.percentile(f, 99)
+        return np.clip((f - lo) / max(hi - lo, 1e-9), 0, 1).astype(np.float64).__mul__(
+            255
+        ).astype(a.dtype)
+
+    assert probe_geometry(global_stretch, name="global-stretch").displacement_px < 0.5
+
+
+def test_probe_still_catches_a_roll_underneath_a_global_tone_map():
+    """The dangerous combination: a warp hidden inside an operator that also
+    changes the whole frame. Removing the global component must not remove the
+    probe's ability to see the local displacement."""
+    import numpy as np
+    from enhancement_eval.contract import probe_geometry
+
+    def stretch_and_roll(a):
+        f = a.astype(np.float64)
+        lo, hi = np.percentile(f, 1), np.percentile(f, 99)
+        out = np.clip((f - lo) / max(hi - lo, 1e-9), 0, 1) * 255
+        return np.roll(out.astype(a.dtype), 1, axis=1)
+
+    with pytest.raises(GeometryViolation, match="moved"):
+        probe_geometry(stretch_and_roll, name="stretch+roll")
