@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+
+# Harness outputs. All of these are regenerable from the manifest + the NAS,
+# and the CSVs carry per-image label geometry that has no business in git.
+*.csv
+raw_cache/
+jpeg_cache/
+looks/
+web/
+*.html

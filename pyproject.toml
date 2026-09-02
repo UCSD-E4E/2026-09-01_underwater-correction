@@ -1,0 +1,11 @@
+[project]
+name = "enhancement-eval"
+version = "0.1.0"
+description = "Offline evaluation harness for underwater image enhancement against the FishSense human-label corpus."
+requires-python = ">=3.13"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: needs the real .ORF fixture or network credentials",
+]
