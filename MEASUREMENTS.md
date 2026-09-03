@@ -389,3 +389,66 @@ serious engineering project rather than a parameter choice.
 along a 1:1 line and are small; use DHT if sharper is wanted. The concept
 (allocating bandwidth by per-channel SNR) is sound and is what ISPs already do
 — the implementation quality is the barrier, not the idea.
+
+## CNDR — reimplemented from the paper, negative
+
+Yan, Wang, Claramunt & Yang (2026), "Underwater image enhancement via
+color-noise decoupling and reconstruction with application to tidal stream
+turbine", *J. Ocean Eng. Mar. Energy* 12:1151–1163,
+doi:10.1007/s40722-026-00480-7. No code released, so `enhancement_eval/cndr.py`
+is built from the equations; 35 tests, geometry probe 0.000 px.
+
+Worth trying because its stated problem is the one measured here. Its eq 3 —
+enhancement applies a per-channel gain, so `y_hat = k_c·x + k_c·n`, worst in
+red because red needs the most gain — is the CLAHE noise amplification that
+made us turn CLAHE off. It is also non-learned, so there is no training
+distribution to be out of on pool dives.
+
+Nine frames, six reef and three pool. Noise in open water, detail on the fish
+between head and tail keypoints, as everywhere else in this file.
+
+| variant (reef, 6 frames)     | water grain | σ̄ eq 17 | fish grain | separation |
+|------------------------------|------------:|--------:|-----------:|-----------:|
+| production (auto-gamma+CLAHE) |       7.035 |  14.479 |     10.929 |      1.560 |
+| **recommended (ships)**       |   **7.118** |**12.417**| **10.608**|  **1.507** |
+| CNDR full, replacing stretch  |       6.762 |  12.509 |      9.952 |      1.485 |
+| CNDR DAC only, replacing WB   |       4.293 |   8.600 |      6.048 |      1.418 |
+| CNDR contrast only, on top    |      11.060 |  18.982 |     17.020 |      1.573 |
+
+**The complete published method is worse than what we ship** — separation 1.485
+against 1.507, and it wins on only 4 of 6 frames with a mean delta of −0.022.
+
+**DAC is the weakest stage, not the strongest.** This was the piece predicted to
+beat the hand-tuned `red_boost`, on the reasoning that compensating from green
+and blue (eqs 8–10) avoids multiplying red noise by a large gain. It does avoid
+that — water grain drops to 4.293 — but it takes 43% of the fish detail with it
+(6.048 against 10.608) and lands at the worst separation of any arm. On pool
+frames it drives red to a mean of 114 against our 69: red overcompensation,
+which is exactly what the stage exists to prevent, appearing out of
+distribution. Pool water is nearly clear, so the cast DAC assumes is not there
+to correct.
+
+**FCR is not a denoiser**, despite sec 3.5's framing. Its per-coefficient gain
+is `1 + β·α`, which is ≥ 1 everywhere, so no coefficient ever shrinks. Eq 14
+suppresses noise only *relative* to features. Measured, open-water grain rose
+**×1.53**. The contrast stage does buy the best separation in the table
+(1.573, winning 5 of 6 frames) — but at ×1.50 the water noise, which is the
+same separation-for-noise trade CLAHE offers and that we already declined.
+
+**RCR is a scalar multiply.** Eq 12 is `U(μΣ)Vᵀ`, and since μ is a scalar from
+eq 13, that is `μ·L` — a whole subsection of SVD machinery that cancels. It is
+implemented as the scalar (proved exact in `test_rcr_is_algebraically_a_scalar_gain`),
+which also avoids an SVD of a 12-megapixel matrix per frame. Its apparent
+separation gain (+0.051 with water noise ×0.93) comes from a global brightening
+interacting with clipping and 8-bit quantization, not from any structural
+improvement, and should not be read as a win.
+
+**Recommendation: do not ship CNDR.** Keep the module: the undecimated Haar
+transform is reusable, eq 17 gives a noise figure directly comparable with the
+rest of this file, and the per-stage ablations are the evidence for this
+negative. The one idea worth carrying forward is FCR's *relative* weighting —
+it is the only arm that improved separation on 6 of 6 reef frames — but it
+needs a formulation whose gain can go below 1, which eq 16 forbids by
+construction.
+
+Cost: 22 s/frame for the full method against 6 s for the shipped decode.
