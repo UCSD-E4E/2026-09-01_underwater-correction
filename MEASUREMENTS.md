@@ -89,3 +89,71 @@ Full-frame decode on a 3016x4014 raw: `rawpy.postprocess` 2.2 s, auto-gamma
 0.9 s, **`equalize_adapthist` 10.2 s**, conversion 0.6 s. CLAHE is 73% of it,
 which is why caching the shared postprocess across arms would save only 16% and
 why `--jobs` (process parallelism) is the optimization that matters.
+
+## Burst stacking — closed, negative
+
+EXIF timestamps have 1-second resolution, so "same second" only bounds the gap
+from above. 13,087 frames sit within 1 s of the previous.
+
+Registration is possible but not the problem. ORB + RANSAC over three dives:
+
+| dive | inliers | median displacement |
+|---|---|---|
+| 223 | 1197 | 19.7 px |
+| 370 | 1342 / 1787 / 1816 | 37–75 px |
+| 145 | 4–9 | 270 / 1860 px (failed) |
+
+Where it registers, noise averages down exactly as predicted — dive 370's
+open-water noise fell to 0.46x on four frames against the 1/sqrt(4) = 0.50
+ideal. Earlier attempts (ECC affine, phase correlation) failed only because
+they are global-intensity methods on a low-contrast repetitive scene.
+
+It still does not help, for two reasons visible in the stacked frame:
+
+* **The fish smears.** The homography is fit on the whole scene, which is
+  dominated by static reef; a swimming fish moves independently and blurs.
+* **The laser dot multiplies.** The dot is not a scene feature — it is light
+  projected from the rig. Moving the rig moves the dot *across* the scene, so
+  aligning the scene necessarily de-aligns the dot. Four frames give four dots
+  in a line: fabricated features indistinguishable from the real one, the same
+  failure class as the difference-of-Gaussians dot boost.
+
+So stacking cleans the part of the frame nobody labels and corrupts both parts
+they do. Making it work needs non-rigid alignment on the fish plus dot masking,
+for a bounded payoff (sqrt(N) on texture that is only 1.6x above the grain).
+
+## Range-based attenuation — real, not yet invertible
+
+Regressing log channel ratio on `LaserDepth.range_m`, sampled on a linear
+decode in an annulus around the laser dot (the one region whose range is
+known), per dive:
+
+| dive | site | n | range | d log(R/G)/dz | r² |
+|---|---|---|---|---|---|
+| 341 | field | 135 | 0.46–2.75 m | −0.352 ± 0.043 | 0.34 |
+| 349 | field | 115 | 1.05–2.98 m | −0.220 ± 0.044 | 0.18 |
+| 465 | field | 65 | 1.05–5.45 m | −0.095 ± 0.026 | 0.18 |
+| 60 | **pool** | 103 | 0.63–2.16 m | +0.286 ± 0.108 | 0.07 |
+
+**What holds.** All three field dives are significantly negative (t = 8.2, 5.0,
+3.7): red attenuates faster than green, recovered from nothing but the laser's
+metric range. The pool dive shows no coherent signal, which is correct — clear
+water has almost no differential attenuation over 2 m, so its regression picks
+up scene confounds instead. Where significant, log(B/G) has the opposite sign
+(341: +0.149, 465: +0.056), giving the textbook ordering beta_r > beta_g > beta_b.
+
+**What does not.** Magnitudes vary 3.7x across field dives, and binned medians
+show dive 465 nearly flat (−0.027/m by medians against −0.095/m from OLS, so
+that slope is leverage-driven). Dive 341 is not monotonic. Backscatter
+saturation does not explain it: 465 is flat at short range too.
+
+**Why.** Every frame is a different scene, so reflectance varies frame to frame
+and does not average out at n = 65–135. That is exactly what the r² of 0.18–0.34
+is reporting.
+
+**The fix, and why it is blocked.** Fitting on the dive slate would hold
+reflectance constant and remove the dominant noise term. 220 slate frames carry
+a metric range — but 7 of the 8 dives contributing them are Pool Calibration,
+where there is no attenuation to measure. Only dive 341 has field slate frames
+(30), too few to fit. Closing this needs field slate frames at varied range,
+i.e. new collection, not new analysis.
