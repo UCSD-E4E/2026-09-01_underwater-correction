@@ -39,6 +39,8 @@ import ast
 import csv
 import math
 import os
+import random
+from collections import defaultdict
 import sys
 import time
 from pathlib import Path
@@ -221,6 +223,112 @@ def cmd_effort(args: argparse.Namespace) -> int:
         n = required_per_arm(pct / 100, sd)
         minutes = 2 * n * median / 60
         print(f"    {pct:3d}% reduction   {int(n):6d} per arm   (~{minutes:.0f} min of labeling total)")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# trial: build the labeling A/B
+# --------------------------------------------------------------------------
+
+
+def cmd_trial(args: argparse.Namespace) -> int:
+    """Select backlog frames, allocate them to arms, and render the JPEGs.
+
+    Writes local files only. Nothing here touches Label Studio, Garage or the
+    API -- loading the trial is a deliberate, separate, human step.
+    """
+    from enhancement_eval.recommended import PRODUCTION, RECOMMENDED, RECOMMENDED_WITH_DOT
+    from enhancement_eval.trial import BACKLOG_SQL, assign_arms, summarize_allocation
+
+    dsn = os.environ.get("FISHSENSE_DSN")
+    if not dsn:
+        _die("Set FISHSENSE_DSN (a restored backup is preferable to prod).")
+
+    import psycopg
+
+    with psycopg.connect(dsn) as conn:
+        conn.read_only = True
+        with conn.cursor() as cur:
+            cur.execute(BACKLOG_SQL)
+            cols = [c.name for c in cur.description]
+            backlog = [dict(zip(cols, r)) for r in cur.fetchall()]
+    print(f"{len(backlog)} frames in the species backlog")
+
+    raw_root = Path(args.raw_root).expanduser() if args.raw_root else None
+    if raw_root is None:
+        _die("--raw-root is required to render the trial JPEGs")
+
+    per_dive = defaultdict(list)
+    for row in backlog:
+        per_dive[row["dive_id"]].append(row)
+
+    n_arms = len([a for a in args.arms.split(",") if a])
+    wanted = args.per_arm * n_arms
+    # Draw several frames from each dive rather than one frame from very many.
+    #
+    # With one frame per dive, every dive lands in exactly one arm: within-dive
+    # blocking does nothing, and -- worse -- the stratified question this
+    # project most wants to ask ("did it help more on the murkier dives?")
+    # becomes unanswerable, because no dive is represented in both arms.
+    # `--per-dive` frames from `wanted // per_dive` dives keeps coverage broad
+    # while making each dive its own little balanced experiment.
+    per_dive_target = max(n_arms, args.per_dive)
+
+    # Availability is checked per candidate as it is drawn, never over the
+    # whole backlog: the mount is slow enough that stat-ing 27k paths dominates
+    # the run, and only a few hundred are ever needed.
+    chosen: list[dict] = []
+    checked = 0
+    dives = sorted(per_dive)
+    rng_dives = list(dives)
+    random.Random(args.seed).shuffle(rng_dives)
+    for dive in rng_dives:
+        if len(chosen) >= wanted:
+            break
+        taken = 0
+        for candidate in per_dive[dive]:
+            if taken >= per_dive_target or len(chosen) >= wanted:
+                break
+            checked += 1
+            if resolve_under_root(raw_root, candidate["image_path"]):
+                chosen.append(candidate)
+                taken += 1
+    print(f"drew {len(chosen)} frames from "
+          f"{len({r['dive_id'] for r in chosen})} dives "
+          f"({checked} candidates checked for a readable .ORF)")
+
+    ARMS = {"control": PRODUCTION, "recommended": RECOMMENDED,
+            "recommended-dot": RECOMMENDED_WITH_DOT}
+    arm_names = tuple(a for a in args.arms.split(",") if a in ARMS)
+    if len(arm_names) < 2:
+        _die(f"--arms must name at least two of: {', '.join(ARMS)}")
+
+    allocation = assign_arms(chosen, arms=arm_names, seed=args.seed)
+    print()
+    print(summarize_allocation(allocation))
+
+    out = Path(args.out)
+    (out / "jpeg").mkdir(parents=True, exist_ok=True)
+    with (out / "allocation.csv").open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["image_id", "dive_id", "dive_name", "checksum", "arm",
+                        "decode", "jpeg", "image_path"],
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        for row in allocation:
+            writer.writerow(dict(row, decode=ARMS[row["arm"]].label,
+                                 jpeg=f"jpeg/{row['checksum']}.JPG"))
+    print(f"\nwrote allocation -> {out / 'allocation.csv'}")
+
+    if args.no_render:
+        print("--no-render: skipping JPEG rendering")
+        return 0
+
+    from enhancement_eval.trial_render import render_allocation
+
+    render_allocation(allocation, ARMS, raw_root, out / "jpeg", jobs=args.jobs)
     return 0
 
 
@@ -587,6 +695,23 @@ def main(argv: list[str] | None = None) -> int:
         "corpus max is 868537, i.e. ten days)",
     )
     f.set_defaults(func=cmd_effort)
+
+    tr = sub.add_parser(
+        "trial", help="build the labeling A/B: select, allocate, render (local files only)"
+    )
+    tr.add_argument("--out", default="trial")
+    tr.add_argument("--raw-root", default=None, help="NAS root Image.path is relative to")
+    tr.add_argument("--per-arm", type=int, default=127,
+                    help="frames per arm (127 detects a 20%% effect on species work)")
+    tr.add_argument("--arms", default="control,recommended")
+    tr.add_argument("--per-dive", type=int, default=4,
+                    help="frames drawn per dive (default 4). One per dive would "
+                         "leave every dive in a single arm, disabling both the "
+                         "blocking and the per-dive stratified comparison.")
+    tr.add_argument("--seed", type=int, default=20260902)
+    tr.add_argument("--jobs", type=int, default=6)
+    tr.add_argument("--no-render", action="store_true")
+    tr.set_defaults(func=cmd_trial)
 
     rec = sub.add_parser(
         "recommend", help="print the recommended configurations and what settles them"

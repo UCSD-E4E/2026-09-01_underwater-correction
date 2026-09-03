@@ -13,3 +13,7 @@ jpeg_cache/
 looks/
 web/
 *.html
+
+# Trial output: 254 full-resolution JPEGs (~1.8 GB) plus its allocation.
+# Regenerable from the backlog query and the seed.
+trial/
