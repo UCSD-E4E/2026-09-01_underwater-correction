@@ -84,6 +84,25 @@ Avoid direct glare; 40% of existing frames were rejected as saturated.
   from the bottom of its range failed on field frames: gray-world, white-patch,
   per-channel stretch, and production's accidental per-channel CLAHE.
 
+## 5b. Do not rebuild LibRaw for a better demosaic
+
+Asked directly, the answer is no. DHT is the largest difference available among
+stock algorithms (+16% fish detail, +18% noise) and is barely visible on one
+reef frame and invisible on another. LMMSE and AMaZE — the two usually
+recommended for noisy raws, and the only reason to rebuild — carry published
+advantages of fractions of a dB over AHD. You would be rebuilding a toolchain
+to buy something smaller than the difference you already cannot see.
+
+The costs are not trivial either: those algorithms live in LibRaw's GPL2/GPL3
+demosaic packs, which is a licensing question for `fishsense-core` rather than
+a build flag; the data-worker would need a custom pinned rawpy wheel; and every
+existing JPEG was rendered with stock AHD, so re-rendering mixes vintages inside
+Label Studio projects and confounds the labeling-time comparison.
+
+**Revisit only if** the trial shows labelers are measurably sensitive to the
+sharpness/noise axis. The cheap way to learn that is to add DHT as a third trial
+arm: 254 more frames of rendering, zero build work.
+
 ## 6. Open, in priority order
 
 1. **Per-pixel depth.** `seathru.remove_water` assumes uniform range because

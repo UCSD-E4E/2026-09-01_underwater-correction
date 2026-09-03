@@ -223,3 +223,169 @@ physics contribution is the modest one tabulated above.
 the corpus has range at exactly one pixel. That is right for the fish the laser
 is on and increasingly wrong for background. Scaling a monocular depth estimate
 by the laser's metric range is the step that lifts it, and is not implemented.
+
+## Cross-channel denoising — tried, does not beat isotropic
+
+Two ideas exploiting the same asymmetry: red is the noisiest channel
+(water-region high-frequency energy 9.50 against green's 6.88 on dive 370),
+while luminance is 0.21R + 0.72G + 0.07B, so structure lives mostly in green.
+
+* **red-only** — filter red hard, leave green and blue bit-identical.
+* **guided** — use green as a guide to filter red and blue (He et al.).
+
+Two reef frames, relative to no denoise:
+
+| variant | luma water | luma fish | chroma water | chroma fish | luma ratio |
+|---|---|---|---|---|---|
+| red-only 0.6 | 0.94x | 0.94x | 0.99x | 1.00x | 1.01 |
+| red-only 0.9 | 0.92x | 0.93x | 0.99x | 1.00x | 1.04 |
+| guided 0.6 | 0.71x | 0.72x | 0.95x | 0.81x | 1.04 |
+| guided 0.9 | 0.70x | 0.70x | 0.95x | 0.82x | 0.99 |
+| *tv-pre (isotropic)* | *0.22x* | *0.53x* | — | — | **1.66** |
+
+Both remove noise and fish detail in near-equal proportion (ratio ~1.0), where
+plain total variation manages 1.66.
+
+**Why guided filtering fails here specifically.** It assumes a *clean* guide.
+Green is only 28% less noisy than red (6.88 vs 9.50), not the 5-10x that would
+make it a reliable structure reference, so it transfers its own noise into the
+channels it is supposed to be cleaning.
+
+**Why red-only cannot help much.** Red is 21% of luminance, and linear red in
+open water averages 0.0129 -- it barely carries signal to begin with, so
+cleaning it changes little that a labeler sees.
+
+### Two bugs found on the way, both about starved channels
+
+1. `estimate_noise` quantised to uint8 for its median filter. Linear red
+   occupies roughly the bottom 5% of the range, so x255 leaves ~13 levels and
+   the estimate collapsed to exactly zero -- making eps zero and the whole
+   filter a silent no-op. Red-only denoising appeared to "do nothing" for two
+   measurement rounds because of this, not because the idea was wrong.
+2. Even computed in float, **MAD is the wrong estimator for a coarsely
+   quantised channel**: over half the pixels equal their own 3x3 median
+   exactly, so the median absolute deviation is 0 regardless. A 75th-percentile
+   fallback fixes it.
+
+Anyone deriving a threshold from a dark channel in this corpus will hit both.
+
+## Bayer-domain denoising — the RGB attempts were in the wrong domain
+
+Cross-channel denoising assumes one channel is an independent, cleaner
+reference for another. Demosaicing destroys that: every output pixel's R, G and
+B are interpolated from overlapping photosite neighbourhoods, so their noise
+becomes shared. Measured on a reef frame, correlation of high-frequency
+residuals between channels:
+
+| pair | before demosaic | after demosaic |
+|---|---|---|
+| R, G | +0.029 | **+0.328** |
+| R, B | +0.009 | +0.145 |
+| G, B | +0.101 | +0.308 |
+
+An order of magnitude. A guide whose noise is a third shared with the channel
+it guides cannot separate that channel's signal from its noise -- which is
+exactly why the RGB-domain guided filter scored a ratio of 0.99, removing
+signal and noise in equal measure.
+
+**G1 - G2 is a signal-free noise measurement.** The two green photosites in a
+2x2 cell sample nearly the same point, so their difference has no scene
+content: sigma = 112.2 DN against a mean green level of 927.5 DN, an SNR of 8.3
+per photosite (red sits at 110.9 DN, 12% of green's level). This is a
+measurement, not an estimate — it needs no assumption about how much of the
+frame is flat and cannot collapse on a starved or quantised channel, which is
+what defeated two earlier RGB-domain estimators.
+
+CFA-domain denoising, guided by (G1+G2)/2, two reef frames:
+
+| variant | luma water | luma fish | chroma water | luma ratio |
+|---|---|---|---|---|
+| cfa 0.05 | 0.31x | 0.44x | 0.63x | 1.22 |
+| **cfa 0.12** | **0.25x** | **0.38x** | **0.58x** | **1.21** |
+| cfa 0.2 | 0.20x | 0.33x | 0.55x | 1.19 |
+| cfa 0.4 | 0.14x | 0.23x | 0.53x | 1.12 |
+| *RGB guided 0.9* | *0.70x* | *0.70x* | *0.95x* | *0.99* |
+| *isotropic tv-pre* | *0.22x* | *0.53x* | — | *1.66* |
+
+**Verdict: the diagnosis was right, the ranking did not change.** Working
+before the demosaic is the correct domain and it removes chroma noise far
+better than anything in RGB space (0.58x against 0.95x). On the luma
+texture-vs-noise ratio it still trails isotropic total variation, though that
+metric counts the fish's own grain as detail and so under-credits any denoiser.
+Visually `cfa 0.12` is the best result produced: scale texture intact, grain
+substantially down, no waxy look. Strengths above ~0.2 smooth structure weaker
+than 2 sigma, and the texture itself is only about 1.2 sigma, so they erase it.
+
+The underlying limit is unchanged: fish texture is ~1.6x the grain in the same
+band, and no filter in any domain separates them cleanly.
+
+## Demosaic choice — every algorithm sits on the same 1:1 line
+
+Production uses rawpy's default (AHD). Holding everything downstream fixed and
+varying only the interpolation, on two reef frames:
+
+| demosaic | luma water | luma fish | chroma water | s/frame |
+|---|---|---|---|---|
+| AHD (production) | 1.00x | 1.00x | 1.00x | 1.6 |
+| **DHT** | 1.18x | **1.16x** | 0.99x | 2.3 |
+| AAHD | 1.14x | 1.12x | 0.98x | 7.8 |
+| DCB | 0.99x | 1.00x | 0.94x | 6.0 |
+| PPG | 0.95x | 0.95x | 1.01x | 1.4 |
+| VNG | 1.00x | 1.00x | 0.97x | 3.3 |
+| linear | 0.75x | 0.70x | 1.02x | 1.5 |
+| AHD + FBDD light | 0.84x | 0.84x | 0.95x | 3.3 |
+| AHD + FBDD full | 0.86x | 0.86x | 0.93x | 3.8 |
+
+Sharper algorithms recover more detail and proportionally more noise; smoother
+ones give up both. Every ratio is near 1.0. Demosaic choice moves *where* you
+sit on the noise-detail line, not the exchange rate — which is the same wall
+every denoiser hit, for the same reason: the texture and the grain occupy the
+same band.
+
+LMMSE and AMaZE, the two algorithms most often recommended for noisy raws, are
+not compiled into this LibRaw build (they need the GPL demosaic pack).
+
+**DHT is a legitimate option** if labelers prefer sharper and grainier: +16%
+fish detail for +18% noise, one parameter, 2.3 s/frame.
+
+## An SNR-aware demosaic — tried, worse on every axis
+
+Stock demosaics treat all three channels as equally worth interpolating.
+Underwater they are not: green sits at 927.5 DN with SNR 8.3 per photosite,
+red at 110.9 DN with roughly a third of that. So interpolate the colour
+difference and let red inherit sharp structure from green:
+
+    R_full = G_full + smooth(R - G)
+
+with a physical justification for smoothing hard — the colour difference is set
+by the water column, which the attenuation fit showed varies smoothly with
+range. Prediction stated in advance: chroma noise down hard, luma fish detail
+held near 1.00x.
+
+| variant | luma water | luma fish | chroma water | chroma fish |
+|---|---|---|---|---|
+| AHD | 1.00x | 1.00x | 1.00x | 1.00x |
+| uw r=3 | 1.56x | 1.52x | 1.03x | 1.22x |
+| uw r=6 | 1.52x | 1.48x | 1.04x | 1.35x |
+| uw r=12 | 1.49x | 1.43x | 1.05x | 1.48x |
+
+**Wrong on every axis named.** Chroma noise unchanged in water and *worse* on
+the fish, luma noise up ~50%.
+
+At least part of the cause is an implementation flaw worth recording, because
+it will bite anyone writing a demosaic: preserving the measured green samples
+exactly while interpolating the gaps leaves a quincunx where half the pixels
+carry raw noise and half carry 4-neighbour averages. On a perfectly flat
+synthetic scene that alone produces **2.21x** the high-frequency energy of a
+uniformly interpolated green — a checkerboard of noise *variance* that any
+high-frequency metric reads as detail or noise.
+
+Removing the checkerboard by interpolating green uniformly also removes green's
+real detail, which is the channel worth keeping. Resolving that tension is what
+directional interpolation in AHD and DHT exists to do, and matching them is a
+serious engineering project rather than a parameter choice.
+
+**Recommendation: do not write a bespoke demosaic.** The available gains lie
+along a 1:1 line and are small; use DHT if sharper is wanted. The concept
+(allocating bandwidth by per-channel SNR) is sound and is what ISPs already do
+— the implementation quality is the barrier, not the idea.
