@@ -26,7 +26,14 @@ right without having to know the rule.
 
 It is best-effort: the pure-logic modules (`contract`, `metrics`, `sites`,
 `scoring`) have no torch dependency and stay importable without it.
+
+`gpu` is imported first for a second, unrelated ordering rule: it preloads the
+NVIDIA driver by absolute path, which only has any effect if it happens before
+torch initializes CUDA. Without it torch on this machine silently falls back to
+CPU -- which is how a working RTX 3060 got reported as "no usable GPU".
 """
+
+from . import gpu as _gpu  # noqa: F401  (side effect: make the driver findable)
 
 try:  # pragma: no cover - environment-dependent by nature
     import torch as _torch  # noqa: F401  (imported for its side effect: see above)
