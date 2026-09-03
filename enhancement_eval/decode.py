@@ -166,8 +166,17 @@ def slate_patch_gains(
     """
     import cv2
 
+    from enhancement_eval.attenuation import as_polygon
+
+    # `DiveSlateLabel.slate_rectangle` holds two opposite corners, not a
+    # polygon. fillPoly accepts that silently and fills a one-pixel diagonal
+    # line, which is wide enough to pass a size check and contains almost none
+    # of the slate.
+    polygon = as_polygon(quad)
+    if polygon is None:
+        raise ValueError(f"slate quad {quad!r} does not bound an area")
     mask = np.zeros(image.shape[:2], dtype=np.uint8)
-    cv2.fillPoly(mask, [np.asarray(quad, dtype=np.int32).reshape(-1, 1, 2)], 255)
+    cv2.fillPoly(mask, [np.asarray(polygon, dtype=np.int32).reshape(-1, 1, 2)], 255)
     inside = mask.astype(bool)
     if inside.sum() < 16:
         raise ValueError(
