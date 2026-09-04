@@ -595,3 +595,42 @@ help for head/tail on degraded frames — but it is disqualified for anything
 that needs fine scales. It could still keep coarser scales on larger, closer
 fish (a 15 px output period is 7.5 px in the plane); the scan for frames with
 resolvable scales (`scaled.csv`) is where that gets tested.
+
+## BM3D on full-resolution luminance — keeps the scales, dive 223
+
+`enhancement_eval/bm3d_arm.py`, 10 tests. After demosaic, on CIELAB L with a
+and b passed through; noise model is a PSD measured from the open-water patch
+rather than a scalar σ, because demosaicing colours the noise and a white
+σ over-smooths exactly where the scales live. JPEG-stage, so it satisfies
+constraint #2 and goes through `probe_geometry` (0.000 px) like any other
+enhancer — neither of which the mosaic-domain N2V could offer.
+
+Full frame, dive 223, PSD from the top-left fifth, fish patch 229 px:
+
+| | scale retention | grain | displacement | time |
+|---|---:|---:|---:|---:|
+| shipped decode | 1.00 | — | — | 6 s |
+| N2V (Bayer domain) | **0.00** | /4.78 | 0.111 px | 30 s |
+| BM3D, 0.5× measured PSD | **0.84** | /3.67 | **0.009 px** | 173 s |
+| BM3D, 1.0× measured PSD | 0.66 | /3.47 | 0.002 px | 194 s |
+
+Half the measured PSD keeps 84% of the scale peak with three-quarters of
+N2V's grain reduction, and moves nothing — displacement is at the phase-
+correlation floor, a tenth of N2V's. At full strength the rock takes on
+BM3D's familiar painted look and the scales visibly weaken; 0.5 is the point
+on this frame. The grain figure is lower than on the isolated flank crop
+(/5.34) because the full-frame water region carries backscatter and gradient
+that no denoiser removes.
+
+Why it works where N2V cannot: BM3D groups similar patches and filters them
+jointly, so a periodic lattice — as self-similar as content gets — is
+reinforced rather than averaged, and it runs at full resolution where the
+4.5 px lattice is comfortably above Nyquist.
+
+n = 1 frame with a confirmed lattice. A scan of 459 held-out large-fish
+candidates for frames whose scale peak clears 6σ is running to widen this;
+early returns suggest resolvable scales are rare (1 in ~40 frames).
+
+Cost: 173 s per 12-megapixel frame on 16 cores. Offline is fine; the
+production JPEG stage would need the "np" profile swapped for "lc" or a
+tiled/downscaled PSD path before this could sit inline.
