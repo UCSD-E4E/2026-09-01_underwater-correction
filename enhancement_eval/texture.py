@@ -60,8 +60,11 @@ SCALE_PERIOD_MIN_PX = 3.0
 SCALE_PERIOD_MAX_PX = 24.0
 
 
-def radial_power_spectrum(patch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Radially averaged power spectrum. Returns (frequency in cycles/px, power).
+def radial_power_spectrum(
+    patch: np.ndarray, *, with_counts: bool = False
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Radially averaged power spectrum. Returns (frequency in cycles/px, power),
+    plus the number of spectral cells in each annulus when ``with_counts``.
 
     The mean is removed and a Hann window applied before the FFT, so a bright
     patch does not read as low-frequency power and the patch edges do not leak
@@ -91,7 +94,7 @@ def radial_power_spectrum(patch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     sums = np.bincount(which.ravel(), weights=spectrum.ravel(), minlength=n_bins)
     power = np.where(counts > 0, sums / np.maximum(counts, 1), 0.0)
     centres = (edges[:-1] + edges[1:]) / 2
-    return centres, power
+    return (centres, power, counts) if with_counts else (centres, power)
 
 
 def spectral_envelope(power: np.ndarray, window: int | None = None) -> np.ndarray:
@@ -117,13 +120,20 @@ def _scale_band(freqs: np.ndarray) -> np.ndarray:
 
 
 def texture_power(patch: np.ndarray) -> tuple[float, float]:
-    """(peak prominence in the scale band, envelope power in the band).
+    """(peak prominence in the scale band, its sampling noise under no peak).
 
-    The second number is the reference for whether the first is meaningful:
-    a prominence that is a small fraction of the envelope is sampling noise on
-    the median, not a peak.
+    The second number is the yardstick for the first. It is *not* the
+    envelope's total -- comparing a peak to that penalizes narrow peaks, and
+    real scales are narrow: the dive 223 angelfish is six discrete lattice
+    peaks that the radial average spreads over a handful of bins. Against the
+    whole band's envelope those read as 10-20% and were thrown out as noise.
+    Against the noise of the estimate itself they are many sigma.
+
+    Under no peak, each bin's power is a mean over its annulus's cells, so its
+    standard deviation is about ``envelope / sqrt(cells)``; the band sum's
+    noise is the root-sum-square of those.
     """
-    freqs, power = radial_power_spectrum(patch)
+    freqs, power, counts = radial_power_spectrum(patch, with_counts=True)
     envelope = spectral_envelope(power)
     band = _scale_band(freqs)
     # Summed before clipping, for the same reason as everywhere else in this
@@ -132,14 +142,15 @@ def texture_power(patch: np.ndarray) -> tuple[float, float]:
     # the noise level. At sigma 25 it made a perfect denoiser read well under
     # 1.0. Summed first, noise residuals cancel and the peak remains.
     prominence = max(float((power[band] - envelope[band]).sum()), 0.0)
-    return prominence, float(envelope[band].sum())
+    noise = float(np.sqrt((envelope[band] ** 2 / np.maximum(counts[band], 1)).sum()))
+    return prominence, noise
 
 
-#: A peak below this fraction of the envelope is too close to the noise to
-#: measure. Calibrated on a synthetic 7 px scale pattern: at 1.6x the envelope
-#: the estimate is within 2%, at 0.4x within 4%, at 0.1x it is off by 50%.
-#: Below the line the honest answer is "undefined", not a number.
-MIN_PEAK_FRACTION = 0.25
+#: A peak has to stand this many sigma above the estimate's own noise to be
+#: measured. The retention ratio's error is roughly 1/significance on each
+#: side, so this bounds it near +-15%; below the line the honest answer is
+#: "undefined", not a number that will be averaged into a table.
+SIGNIFICANCE = 6.0
 
 
 def texture_retention(fish_before: np.ndarray, fish_after: np.ndarray) -> float:
@@ -148,8 +159,8 @@ def texture_retention(fish_before: np.ndarray, fish_after: np.ndarray) -> float:
     Returns NaN when the input carried no measurable peak in the band -- 0/0
     is not a retention figure and must not be averaged into a table.
     """
-    before, envelope = texture_power(fish_before)
-    if before <= 0 or before < MIN_PEAK_FRACTION * envelope:
+    before, noise = texture_power(fish_before)
+    if before <= 0 or before < SIGNIFICANCE * noise:
         return float("nan")
     after, _ = texture_power(fish_after)
     return after / before

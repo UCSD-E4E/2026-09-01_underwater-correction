@@ -100,9 +100,26 @@ def test_envelope_passes_under_a_peak():
     assert power[peak] > 3 * env[peak], "peak should stand well above the envelope"
 
 
-def test_texture_power_of_pure_noise_is_a_small_fraction_of_the_envelope():
-    prominence, envelope = texture_power(_rng(12).normal(0, 8, (192, 192)))
-    assert prominence < 0.10 * envelope, f"noise alone gave prominence {prominence/envelope:.3f} of envelope"
+def test_texture_power_of_pure_noise_is_not_significant():
+    from enhancement_eval.texture import SIGNIFICANCE
+
+    worst = 0.0
+    for seed in range(6):
+        prominence, noise = texture_power(_rng(100 + seed).normal(0, 8, (192, 192)))
+        worst = max(worst, prominence / noise)
+    assert worst < SIGNIFICANCE, f"pure noise reached {worst:.1f} sigma"
+
+
+def test_a_narrow_lattice_peak_is_significant_even_when_small_against_the_band():
+    """The dive 223 case: real scales are a few discrete peaks, tiny against
+    the whole band's envelope but many sigma above the estimate's noise. A
+    guard that compared them to the envelope total threw them away."""
+    from enhancement_eval.texture import SIGNIFICANCE
+
+    r = _rng(31)
+    weak = 120 + _scales(amplitude=4.0) + r.normal(0, 8.0, (128, 128))
+    prominence, noise = texture_power(weak)
+    assert prominence > SIGNIFICANCE * noise, f"weak lattice only {prominence/noise:.1f} sigma"
 
 
 def test_radial_spectrum_ignores_the_mean():
@@ -176,10 +193,11 @@ def test_retention_is_not_fooled_by_noise_level():
 
 
 def test_retention_declines_to_answer_when_the_peak_is_in_the_noise():
-    """At sigma 25 the scale peak is only ~0.1x the envelope and the estimate
-    is off by half. The metric must say undefined rather than return a number
-    that would be averaged into a table as if it meant something."""
-    fish_clean, fish, water = _scene(noise_sigma=25.0)
+    """At sigma 40 the scale peak sits under 6 sigma of the estimate's own
+    noise. The metric must say undefined rather than return a number that
+    would be averaged into a table as if it meant something. (Sigma 25 is
+    12 sigma and still answers, within 2%.)"""
+    fish_clean, fish, water = _scene(noise_sigma=40.0)
     assert np.isnan(texture_retention(fish, fish_clean))
 
 
