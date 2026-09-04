@@ -17,3 +17,12 @@ web/
 # Trial output: 254 full-resolution JPEGs (~1.8 GB) plus its allocation.
 # Regenerable from the backlog query and the seed.
 trial/
+
+# Repo-local install of bm3d (uv pip install --target .pylib bm3d); see README.
+.pylib/
+
+# Frame lists carry per-image label geometry; the ids alone are committed in data/frame_sets.json.
+data/*.csv
+data/crops/
+
+data/*.log
