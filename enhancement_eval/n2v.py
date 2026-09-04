@@ -79,6 +79,16 @@ class N2VConfig:
     #: `noise_structure.recommended_mask_width` rather than guessing; 1 is a
     #: plain N2V point mask and is only right for isotropic noise.
     mask_width: int = 5
+    #: Whether a site may be predicted from the other three planes.
+    #:
+    #: True exploits the near-independence of the four photosites' noise, which
+    #: is the Bayer-aware cross-channel denoising this module was built for.
+    #: But the planes are not co-located -- R, G1, G2 and B sit at the four
+    #: corners of a Bayer quad -- and stacking them as channels at one array
+    #: index asserts that they are. Borrowing across them therefore borrows
+    #: from half a photosite away, and that showed up as a measured 0.21 px
+    #: displacement of the finished decode. Set False to forbid the borrowing.
+    cross_plane: bool = True
     seed: int = 0
     device: str | None = None
 
@@ -94,7 +104,9 @@ def _device(config: N2VConfig) -> torch.device:
 # ---------------------------------------------------------------------------
 
 
-def make_blind_spots(shape, rate: float, generator: torch.Generator | None = None) -> torch.Tensor:
+def make_blind_spots(
+    shape, rate: float, generator: torch.Generator | None = None, *, cross_plane: bool = True
+) -> torch.Tensor:
     """Select pixels to hide, at most one plane per site.
 
     Sites are drawn first and a plane is then chosen for each, so the other
@@ -106,10 +118,20 @@ def make_blind_spots(shape, rate: float, generator: torch.Generator | None = Non
     the site probability has to be ``rate * c`` for that to come out right --
     without the factor the effective rate would be a quarter of what was asked
     for, and the model would train on a quarter of the intended signal.
+
+    With ``cross_plane=False`` every plane at a selected site is masked
+    together, so the network cannot borrow across planes at all. That costs the
+    cross-channel information but removes a mis-registration: the four planes
+    sit at *different* positions in the Bayer quad, and stacking them as
+    channels at one array index tells the network they are co-located. See
+    `N2VConfig.cross_plane`.
     """
     b, c, h, w = shape
     device = generator.device if generator is not None else None
-    site = torch.rand(b, 1, h, w, generator=generator, device=device) < min(rate * c, 1.0)
+    site_rate = min(rate * c, 1.0) if cross_plane else rate
+    site = torch.rand(b, 1, h, w, generator=generator, device=device) < site_rate
+    if not cross_plane:
+        return site.expand(b, c, h, w).clone()
     which = torch.randint(0, c, (b, 1, h, w), generator=generator, device=device)
     planes = torch.arange(c, device=which.device).view(1, c, 1, 1)
     return site & (which == planes)
@@ -261,7 +283,8 @@ def train(planes: np.ndarray, config: N2VConfig | None = None, *, log=None) -> B
             for i in range(config.batch)
         ])
 
-        mask = make_blind_spots(batch.shape, config.mask_rate, generator=generator)
+        mask = make_blind_spots(batch.shape, config.mask_rate, generator=generator,
+                                cross_plane=config.cross_plane)
         masked = apply_blind_spots(batch, mask, config.mask_width, generator=generator)
         batch, masked, mask = batch.to(device), masked.to(device), mask.to(device)
         loss = n2v_loss(model(masked), batch, mask)

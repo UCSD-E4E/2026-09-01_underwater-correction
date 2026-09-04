@@ -452,3 +452,95 @@ needs a formulation whose gain can go below 1, which eq 16 forbids by
 construction.
 
 Cost: 22 s/frame for the full method against 6 s for the shipped decode.
+
+## Noise2Void trained on our own corpus — works, with a real cost
+
+`enhancement_eval/n2v.py`, 18 tests. Trained on 144 crops from 72 dives, 8000
+steps in 191 s on the RTX 3060. Evaluation frames held out by image id. Both
+arms share one finishing path, so the only difference is whether the mosaic was
+denoised. Gated first by `noise_structure` — see below.
+
+The one learned method that does not inherit the out-of-distribution problem
+that killed the slate detector: no clean targets and no external dataset, so
+pool dives are in-distribution because they are in the training set. And it is
+a denoiser rather than a generator — it predicts a pixel from its neighbourhood
+and structurally cannot invent content.
+
+| reef, 6 held-out frames | shipped | + N2V | change |
+|---|---:|---:|---|
+| open-water grain | 7.12 | 1.40 | **÷5.2** |
+| fish detail | 10.61 | 2.29 | **÷4.6** |
+| separation | 1.507 | 1.714 | +0.21 (see below) |
+| displacement | — | 0.083 px mean, 0.205 px worst | |
+
+**The noise reduction is real and large.** On degraded frames it is not subtle:
+dive 156 goes from near-pure grain to readable rock structure. Open water shows
+no blotching and no tile seams. The laser dot survives and reads *more* clearly
+against the cleaner background.
+
+**The separation figure should not be quoted.** It rises 1.507 → 1.714 only
+because both of its terms collapsed together — water grain ÷5.2 and fish detail
+÷4.6. On this result the ratio is close to meaningless and the absolute numbers
+are what to read. This is the confound that made the earlier whole-frame
+"detail" metric useless, reappearing in a ratio instead of a raw number.
+
+**The cost is fine texture.** The reticulated scale pattern on the dive 223
+angelfish is gone. Head/tail outlining looks easier — the body outline, fins,
+snout and eye are all cleaner. Species identification may be harder. No metric
+here can adjudicate that; the labeling trial can, which is what it is for.
+
+**Displacement is real but small.** 0.083 px mean, 0.205 px worst, verified
+against controls: a symmetric Gaussian blur reads 0.003 px and a known 1 px
+roll reads 1.000 px, so phase correlation is good to about 0.01 px here. Inside
+the 0.5 px hard limit, above the 0.1 px warning on 2 of 9 frames.
+
+Two hypotheses about the cause of that shift, both wrong, both instructive:
+
+| configuration | mean shift | worst | grain |
+|---|---:|---:|---:|
+| cross-plane + 5-wide mask (as measured) | **0.083** | 0.205 | 5.2× |
+| point mask instead | 0.190 | 0.269 | 5.6× |
+| no cross-plane borrowing | 0.891 | 1.622 | 6.9× |
+
+The blind spot masks one plane at a time so the network can predict it from the
+other three, which is valid because the four photosites' noise is nearly
+independent (0.029 raw). The suspicion was that borrowing across planes borrows
+from half a photosite away, since R/G1/G2/B sit at different corners of the
+Bayer quad. Removing the borrowing made displacement 4–8× *worse* and broke the
+0.5 px limit on every reef frame — cross-plane information anchors the
+prediction rather than displacing it. Replacing the measured 5-wide horizontal
+mask with a point mask also made it worse. Both measurement-driven design
+choices were right, and the residual shift looks intrinsic to heavy denoising
+rather than attributable to either knob.
+
+**Status: diagnostic, not shippable as-is.** It operates on the mosaic, so it
+sits before the JPEG stage — the same status as the earlier CFA work under
+constraint #2. **Recommendation: put it in the labeling trial as a third arm**
+rather than shipping or discarding it. The detail loss is a genuine risk to
+species ID and a genuine gain for head/tail, and only labelers can settle which
+dominates.
+
+## Noise2Void viability gate — the assumptions hold, and are directional
+
+`enhancement_eval/noise_structure.py`, 18 tests. Run before training, because
+N2V fails *silently* when its assumptions break: the loss curve looks healthy
+and the output looks smoother, since the independent part of the noise still
+goes. Measured from G1−G2, which is signal-free, sampled in open water.
+
+| | measured | limit |
+|---|---:|---:|
+| max off-diagonal autocorrelation | 0.044 | 0.10 |
+| fixed-pattern fraction | 0.002 | 0.30 |
+| σ | 134.71 DN | |
+
+Both assumptions hold. The control behaves as designed: whole-frame
+autocorrelation reads 0.109 against 0.044 in open water, confirming that scene
+detail leaks into G1−G2 and that the open-water crop is doing real work.
+
+**The noise is directional**, which the gate turned into a design decision
+rather than a footnote. Horizontal lag-1 correlation runs 7.5× the vertical —
+up to 0.162 on bright pool frames against ~0.01 down columns. It is not
+row-readout noise: that would stay flat along the row, and this decays
+geometrically (0.162, 0.088, 0.050, 0.031, 0.016, 0.008), which is the analog
+readout chain's horizontal bandwidth limit. So the blind spot is a 5-wide
+horizontal line, from `recommended_mask_width`, not the paper's default point.

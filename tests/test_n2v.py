@@ -220,3 +220,30 @@ def test_denoise_does_not_mutate_its_input():
     before = planes.copy()
     denoise_planes(net, planes)
     assert np.array_equal(planes, before)
+
+
+def test_cross_plane_off_masks_every_plane_at_a_site():
+    """The alternative to cross-plane borrowing, and the reason it exists.
+
+    The four planes sit at different corners of the Bayer quad, so predicting
+    one from the others at "the same" array index borrows from half a photosite
+    away. Measured, that displaced the finished decode by 0.21 px -- inside the
+    0.5 px hard limit but above the 0.1 px warning. Masking every plane at a
+    site removes the borrowing entirely.
+    """
+    mask = make_blind_spots((2, 4, 48, 48), rate=0.05,
+                            generator=torch.Generator().manual_seed(21), cross_plane=False)
+    per_site = mask.sum(dim=1)
+    assert set(per_site.unique().tolist()) <= {0, 4}, "a site is either fully masked or not at all"
+    assert mask.any()
+
+
+def test_cross_plane_on_and_off_hit_similar_pixel_counts():
+    """So a comparison between the two is about the borrowing, not about one
+    model seeing four times the supervision of the other."""
+    kw = dict(rate=0.02, generator=torch.Generator().manual_seed(22))
+    on = make_blind_spots((4, 4, 64, 64), **kw).float().mean().item()
+    off = make_blind_spots((4, 4, 64, 64), rate=0.02,
+                           generator=torch.Generator().manual_seed(22),
+                           cross_plane=False).float().mean().item()
+    assert 0.5 < off / on < 2.0, f"rates differ too much: {on:.4f} vs {off:.4f}"
