@@ -209,6 +209,23 @@ def _block(cin: int, cout: int) -> nn.Sequential:
     )
 
 
+_LEGACY_KEYS = {
+    "enc1": "encoders.0", "enc2": "encoders.1", "enc3": "encoders.2",
+    "up2": "ups.0", "dec2": "decoders.0", "up1": "ups.1", "dec1": "decoders.1",
+}
+
+
+def _upgrade_legacy_keys(state_dict):
+    """Map a three-level checkpoint's original layer names onto the current ones."""
+    if not any(k.split(".")[0] in _LEGACY_KEYS for k in state_dict):
+        return state_dict
+    out = {}
+    for key, value in state_dict.items():
+        head, _, rest = key.partition(".")
+        out[f"{_LEGACY_KEYS.get(head, head)}.{rest}" if rest else _LEGACY_KEYS.get(head, head)] = value
+    return out
+
+
 class BlindSpotUNet(nn.Module):
     """A small U-Net, 4 planes in and 4 out, with a configurable depth.
 
@@ -247,6 +264,16 @@ class BlindSpotUNet(nn.Module):
             [_block(widths[i - 1] * 2, widths[i - 1]) for i in range(levels - 1, 0, -1)]
         )
         self.out = nn.Conv2d(widths[0], channels, 1)
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        """Accepts checkpoints saved before `levels` existed.
+
+        The first trained models named their layers enc1/enc2/enc3/up2/dec2/
+        up1/dec1. Renaming the modules for a configurable depth silently broke
+        loading them, which cost a re-measurement; a saved model should not
+        stop loading because the class that made it was refactored.
+        """
+        return super().load_state_dict(_upgrade_legacy_keys(state_dict), strict=strict, assign=assign)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, _, h, w = x.shape

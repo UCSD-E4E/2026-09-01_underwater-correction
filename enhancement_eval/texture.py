@@ -9,20 +9,29 @@ removed. It is high-frequency energy, and on a raw frame that energy is mostly
 grain. A denoiser that erases scales and noise scores the same on it as one
 that erases only the noise.
 
-This module separates the two by subtracting the noise floor. Open water has
-no texture, so its power spectrum *is* the noise spectrum; the fish patch's
-spectrum minus the water patch's is the texture's own power, independent of
-how noisy the frame was. Measure that before and after a denoiser, over the
-band where scales live, and the ratio is how much texture survived:
+This module separates them by what scales *are* spectrally. Looked at on a
+real frame (dive 223, the angelfish flank), scales are a sharp peak in the
+radial power spectrum at a period of about 4.5 px, standing well above a
+smooth envelope; noise is that smooth envelope. After Noise2Void the peak is
+gone and the envelope is lower -- the spectrum shows the scale loss directly.
 
-    retention = sum_band [P_fish_after - P_water_after]
-              / sum_band [P_fish_before - P_water_before]
+So texture is measured as **peak prominence above the fish patch's own smooth
+spectral envelope**, over the band where scales live:
 
-A denoiser that removes only noise scores near 1.0, because the subtraction
-cancels the noise on both sides. One that smooths the fish scores well below
-it. `test_perfect_denoiser_retains_everything` is the case that matters: the
-old figure would have reported a large *drop* there, because what it was
-mostly measuring had been removed.
+    texture = sum_band max(0, P(f) - envelope(f))
+    retention = texture_after / texture_before
+
+where the envelope is a running median of log-power across frequency, wide
+enough to pass under a peak. A denoiser that removes only noise lowers the
+envelope and leaves the peak, scoring ~1.0; a blur flattens the peak and
+scores near 0; a linear filter with gain g at the scale frequency scores g^2,
+the fraction of scale-band power it kept.
+
+An earlier design subtracted the open-water spectrum as the noise floor. It
+failed on real frames twice over: shot noise scales with brightness so the
+water's floor is the wrong level for the fish, and the fish flank's scale
+texture is only modestly above noise, so a subtraction with its own sampling
+error mostly returned "undefined". Measuring the peak needs no second patch.
 """
 
 from __future__ import annotations
@@ -38,6 +47,8 @@ __all__ = [
     "assess",
     "grain_reduction",
     "radial_power_spectrum",
+    "spectral_envelope",
+    "texture_power",
     "texture_retention",
 ]
 
@@ -48,11 +59,6 @@ __all__ = [
 SCALE_PERIOD_MIN_PX = 3.0
 SCALE_PERIOD_MAX_PX = 24.0
 
-#: Periods where scale texture has no power and the spectrum is noise alone.
-#: Used to level-match the noise floor to the fish patch itself.
-NOISE_TAIL_MIN_PX = 2.0
-NOISE_TAIL_MAX_PX = 2.7
-
 
 def radial_power_spectrum(patch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Radially averaged power spectrum. Returns (frequency in cycles/px, power).
@@ -62,12 +68,18 @@ def radial_power_spectrum(patch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     across the spectrum. Power is averaged in annular bins of radial frequency,
     which makes the result independent of texture orientation -- scales run
     whichever way the fish is facing.
+
+    Power is normalized by the window's energy, so white noise of variance
+    sigma^2 reads as sigma^2 per bin *whatever the patch size*. Without that,
+    |FFT|^2 grows with pixel count, and a 320 px water patch read 4x above a
+    200 px fish patch at the same noise level -- an error the synthetic tests
+    could not see because every patch in them was 128x128.
     """
     arr = np.asarray(patch, dtype=np.float64)
     arr = arr - arr.mean()
     h, w = arr.shape
     win = np.outer(np.hanning(h), np.hanning(w))
-    spectrum = np.abs(np.fft.fftshift(np.fft.fft2(arr * win))) ** 2
+    spectrum = np.abs(np.fft.fftshift(np.fft.fft2(arr * win))) ** 2 / float((win ** 2).sum())
     fy = np.fft.fftshift(np.fft.fftfreq(h))
     fx = np.fft.fftshift(np.fft.fftfreq(w))
     radius = np.sqrt(fy[:, None] ** 2 + fx[None, :] ** 2)
@@ -82,99 +94,71 @@ def radial_power_spectrum(patch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return centres, power
 
 
-def _band_signal(fish: np.ndarray, water: np.ndarray, level: float | None = None) -> float:
-    """Noise-floor-subtracted texture power in the scale band.
+def spectral_envelope(power: np.ndarray, window: int | None = None) -> np.ndarray:
+    """Smooth baseline under a spectrum: a running median of log-power.
 
-    The difference is summed across the band *before* being clipped at zero.
-    Clipping per bin looked harmless and was not: each bin's difference
-    carries sampling noise around the true value, and clipping the negative
-    half of that noise leaves a positive bias that grows with the noise level.
-    On a sigma-25 input it made a perfect denoiser read 0.66 retention, which
-    is the metric being fooled by noise -- the one failure it exists to
-    prevent. Summed first, the sampling noise averages out.
-
-    The water spectrum is interpolated onto the fish patch's frequency axis,
-    so the two patches need not be the same size.
+    A median passes under a narrow peak rather than following it up, which is
+    what makes the peak's prominence measurable. The window is a fraction of
+    the bin count so it scales with patch size; it has to be wider than a
+    scale peak (a few bins) and narrower than the envelope's own curvature.
     """
-    freqs, p_fish = radial_power_spectrum(fish)
-    floor = _noise_floor(freqs, p_fish, water, level)
-    band = (freqs >= 1.0 / SCALE_PERIOD_MAX_PX) & (freqs <= 1.0 / SCALE_PERIOD_MIN_PX)
-    return max(float((p_fish[band] - floor[band]).sum()), 0.0)
+    from scipy.ndimage import median_filter
+
+    n = len(power)
+    window = window or max(9, n // 8)
+    if window % 2 == 0:
+        window += 1
+    logp = np.log(np.maximum(power, 1e-30))
+    return np.exp(median_filter(logp, size=window, mode="nearest"))
 
 
-def _level_ratio(fish: np.ndarray, water: np.ndarray) -> float:
-    """Fish-to-water noise level, read where the spectrum is noise alone."""
-    freqs, p_fish = radial_power_spectrum(fish)
-    f_water, p_water = radial_power_spectrum(water)
-    p_water = np.interp(freqs, f_water, p_water)
-    tail = (freqs >= 1.0 / NOISE_TAIL_MAX_PX) & (freqs <= 1.0 / NOISE_TAIL_MIN_PX)
-    water_tail = float(p_water[tail].mean()) if tail.any() else 0.0
-    return float(p_fish[tail].mean()) / water_tail if water_tail > 0 else 1.0
+def _scale_band(freqs: np.ndarray) -> np.ndarray:
+    return (freqs >= 1.0 / SCALE_PERIOD_MAX_PX) & (freqs <= 1.0 / SCALE_PERIOD_MIN_PX)
 
 
-def _noise_floor(
-    freqs: np.ndarray, p_fish: np.ndarray, water: np.ndarray, level: float | None
-) -> np.ndarray:
-    """The fish patch's noise spectrum: shape from water, level from the fish.
+def texture_power(patch: np.ndarray) -> tuple[float, float]:
+    """(peak prominence in the scale band, envelope power in the band).
 
-    Neither source alone is right. The water patch has the correct spectral
-    *shape* -- demosaicing correlates neighbouring pixels, so the noise is not
-    white and its roll-off has to come from real noise, not an assumption. But
-    its *level* is wrong: shot noise scales with brightness, and a fish is not
-    the same brightness as open water, so subtracting water's floor directly
-    over- or under-corrects. That showed up as a retention of 1.16 on dive 1,
-    texture apparently created by denoising.
-
-    So the water spectrum is rescaled to match the fish patch's own power at
-    periods of 2 to 2.7 px, where scales have no energy and the spectrum is
-    noise alone. Shape from one, level from the other.
-
-    ``level`` is that ratio, and it is measured on the *before* patches and
-    reused for the *after* ones. The mismatch is a property of the scene --
-    how much brighter the fish is than the water -- not of the denoiser, and
-    measuring it after denoising is unstable: a heavy blur empties both tails
-    and the ratio becomes 0/0. That broke the ordering of retention against
-    blur strength before this was pinned.
+    The second number is the reference for whether the first is meaningful:
+    a prominence that is a small fraction of the envelope is sampling noise on
+    the median, not a peak.
     """
-    f_water, p_water = radial_power_spectrum(water)
-    p_water = np.interp(freqs, f_water, p_water)
-    if level is None:
-        tail = (freqs >= 1.0 / NOISE_TAIL_MAX_PX) & (freqs <= 1.0 / NOISE_TAIL_MIN_PX)
-        water_tail = float(p_water[tail].mean()) if tail.any() else 0.0
-        level = float(p_fish[tail].mean()) / water_tail if water_tail > 0 else 1.0
-    return p_water * level
+    freqs, power = radial_power_spectrum(patch)
+    envelope = spectral_envelope(power)
+    band = _scale_band(freqs)
+    # Summed before clipping, for the same reason as everywhere else in this
+    # module: each bin's residual above the envelope carries sampling noise,
+    # and clipping the negative half leaves a positive bias that grows with
+    # the noise level. At sigma 25 it made a perfect denoiser read well under
+    # 1.0. Summed first, noise residuals cancel and the peak remains.
+    prominence = max(float((power[band] - envelope[band]).sum()), 0.0)
+    return prominence, float(envelope[band].sum())
 
 
-def texture_retention(
-    fish_before: np.ndarray,
-    water_before: np.ndarray,
-    fish_after: np.ndarray,
-    water_after: np.ndarray,
-) -> float:
-    """Fraction of scale-band texture power that survived a denoiser.
+#: A peak below this fraction of the envelope is too close to the noise to
+#: measure. Calibrated on a synthetic 7 px scale pattern: at 1.6x the envelope
+#: the estimate is within 2%, at 0.4x within 4%, at 0.1x it is off by 50%.
+#: Below the line the honest answer is "undefined", not a number.
+MIN_PEAK_FRACTION = 0.25
 
-    Returns NaN when the input carried no measurable texture in the band --
-    0/0 is not a retention figure and must not be averaged into a table.
+
+def texture_retention(fish_before: np.ndarray, fish_after: np.ndarray) -> float:
+    """Fraction of scale-band peak power that survived a denoiser.
+
+    Returns NaN when the input carried no measurable peak in the band -- 0/0
+    is not a retention figure and must not be averaged into a table.
     """
-    level = _level_ratio(fish_before, water_before)
-    before = _band_signal(fish_before, water_before, level)
-    if before <= 0:
+    before, envelope = texture_power(fish_before)
+    if before <= 0 or before < MIN_PEAK_FRACTION * envelope:
         return float("nan")
-    # Denominator guard: with no measurable texture the spectrum is all noise,
-    # and sampling variation between two noise patches would otherwise leave a
-    # small positive "signal" that turns into a meaningless retention figure.
-    freqs, p_fish = radial_power_spectrum(fish_before)
-    floor = _noise_floor(freqs, p_fish, water_before, level)
-    band = (freqs >= 1.0 / SCALE_PERIOD_MAX_PX) & (freqs <= 1.0 / SCALE_PERIOD_MIN_PX)
-    if before < 0.15 * float(floor[band].sum()):
-        return float("nan")
-    return _band_signal(fish_after, water_after, level) / before
+    after, _ = texture_power(fish_after)
+    return after / before
 
 
 def _grain(patch: np.ndarray) -> float:
     """High-frequency residual after a 3x3 median -- the grain measure every
     other sweep in MEASUREMENTS.md uses, so the figures line up. A plain
-    standard deviation was tried first and read a /1.2 where this reads /5:
+    standard deviation was tried first and read /1.2 where this reads /5:
     it was counting the water's illumination gradient, which no denoiser
     removes and which is not noise."""
     from scipy.ndimage import median_filter
@@ -209,5 +193,5 @@ class TextureReport:
 def assess(fish_before, water_before, fish_after, water_after) -> TextureReport:
     return TextureReport(
         grain_reduction=grain_reduction(water_before, water_after),
-        texture_retained=texture_retention(fish_before, water_before, fish_after, water_after),
+        texture_retained=texture_retention(fish_before, fish_after),
     )

@@ -9,12 +9,18 @@ and on a raw frame that energy is mostly grain. It cannot tell scales from
 noise, so a denoiser that erases both scores the same as one that erases only
 the noise.
 
-This metric separates them by subtracting the noise floor. Open water has no
-texture, so its power spectrum *is* the noise spectrum; the fish patch's
-spectrum minus the water patch's is the texture's own power. Do that before
-and after denoising, over the band where scales live, and the ratio is how
-much of the texture survived. A denoiser that removes only noise scores near
-1.0. One that smooths the fish scores well below it.
+This metric separates them by what scales are spectrally: a sharp peak in the
+radial power spectrum (about 4.5 px period on the dive 223 angelfish) above a
+smooth envelope, where noise is the envelope. Texture is the peak's prominence
+above the fish patch's own envelope, in the band where scales live; retention
+is that before and after. A denoiser that removes only noise lowers the
+envelope and leaves the peak, scoring ~1.0. One that smooths the fish
+flattens the peak and scores near 0.
+
+An earlier design subtracted the open-water spectrum as a noise floor. On
+real frames it returned mostly "undefined": shot noise scales with brightness
+so water is the wrong floor for a fish, and the scales are only modestly above
+noise, so the subtraction's own error swallowed them.
 """
 
 import numpy as np
@@ -26,6 +32,8 @@ from enhancement_eval.texture import (
     TextureReport,
     grain_reduction,
     radial_power_spectrum,
+    spectral_envelope,
+    texture_power,
     texture_retention,
 )
 
@@ -68,6 +76,35 @@ def test_radial_spectrum_peaks_at_the_texture_period():
     assert abs(peak_freq - np.sqrt(2) / 8.0) < 0.03, f"peak at {peak_freq:.3f}"
 
 
+def test_radial_spectrum_level_does_not_depend_on_patch_size():
+    """White noise of one variance must read the same whatever the patch size.
+    Unnormalized |FFT|^2 grows with pixel count, and on real frames a 320 px
+    water patch read 4x above a 200 px fish patch at the same noise level."""
+    r = _rng(4)
+    _, small = radial_power_spectrum(r.normal(0, 5, (128, 128)))
+    _, large = radial_power_spectrum(r.normal(0, 5, (320, 320)))
+    assert 0.7 < np.median(small[5:-5]) / np.median(large[5:-5]) < 1.4
+
+
+def test_radial_spectrum_of_white_noise_reads_its_variance():
+    _, power = radial_power_spectrum(_rng(8).normal(0, 6.0, (256, 256)))
+    assert 0.7 * 36 < np.median(power[5:-5]) < 1.4 * 36
+
+
+def test_envelope_passes_under_a_peak():
+    """The whole design rests on this: a running median must not follow a
+    narrow peak up, or the peak has no prominence to measure."""
+    _, power = radial_power_spectrum(_scales() + _rng(2).normal(0, 4, (128, 128)))
+    env = spectral_envelope(power)
+    peak = np.argmax(power[3:] ) + 3
+    assert power[peak] > 3 * env[peak], "peak should stand well above the envelope"
+
+
+def test_texture_power_of_pure_noise_is_a_small_fraction_of_the_envelope():
+    prominence, envelope = texture_power(_rng(12).normal(0, 8, (192, 192)))
+    assert prominence < 0.10 * envelope, f"noise alone gave prominence {prominence/envelope:.3f} of envelope"
+
+
 def test_radial_spectrum_ignores_the_mean():
     a = radial_power_spectrum(_scales())[1]
     b = radial_power_spectrum(_scales() + 500.0)[1]
@@ -88,7 +125,7 @@ def test_scale_band_is_where_scales_actually_live():
 
 def test_identity_denoiser_retains_everything():
     _, fish, water = _scene()
-    r = texture_retention(fish, water, fish, water)
+    r = texture_retention(fish, fish)
     assert 0.9 < r < 1.1, f"identity should retain ~1.0, got {r:.3f}"
 
 
@@ -97,7 +134,7 @@ def test_perfect_denoiser_retains_everything():
     the case the old fish-detail figure got wrong: it would have read a
     large *drop* here, because the noise it was mostly measuring is gone."""
     fish_clean, fish, water = _scene()
-    r = texture_retention(fish, water, fish_clean, np.full_like(water, 120.0))
+    r = texture_retention(fish, fish_clean)
     assert 0.85 < r < 1.15, f"perfect denoiser should retain ~1.0, got {r:.3f}"
 
 
@@ -106,7 +143,7 @@ def test_smoothing_denoiser_loses_the_texture():
 
     _, fish, water = _scene()
     blur = lambda a: gaussian_filter(a, 3.0)
-    r = texture_retention(fish, water, blur(fish), blur(water))
+    r = texture_retention(fish, blur(fish))
     assert r < 0.3, f"a sigma-3 blur should erase 7px scales, got {r:.3f}"
 
 
@@ -115,7 +152,7 @@ def test_mild_smoothing_loses_some_texture_not_all():
 
     _, fish, water = _scene()
     blur = lambda a: gaussian_filter(a, 0.8)
-    r = texture_retention(fish, water, blur(fish), blur(water))
+    r = texture_retention(fish, blur(fish))
     assert 0.3 < r < 0.95
 
 
@@ -123,7 +160,7 @@ def test_retention_is_ordered_by_how_much_smoothing_was_applied():
     from scipy.ndimage import gaussian_filter
 
     _, fish, water = _scene()
-    rs = [texture_retention(fish, water, gaussian_filter(fish, s), gaussian_filter(water, s))
+    rs = [texture_retention(fish, gaussian_filter(fish, s))
           for s in (0.5, 1.0, 2.0, 4.0)]
     assert rs == sorted(rs, reverse=True), rs
 
@@ -131,10 +168,19 @@ def test_retention_is_ordered_by_how_much_smoothing_was_applied():
 def test_retention_is_not_fooled_by_noise_level():
     """A denoiser that removes noise but keeps texture must score ~1.0 no
     matter how noisy the input was -- otherwise the metric is measuring the
-    noise, which is the failure it exists to fix."""
+    noise, which is the failure it exists to fix. Sigma 16 puts the peak at
+    about 0.4x the envelope, where the estimate is still within a few %."""
+    fish_clean, fish, water = _scene(noise_sigma=16.0)
+    r = texture_retention(fish, fish_clean)
+    assert 0.8 < r < 1.2, f"got {r:.3f} at sigma 16"
+
+
+def test_retention_declines_to_answer_when_the_peak_is_in_the_noise():
+    """At sigma 25 the scale peak is only ~0.1x the envelope and the estimate
+    is off by half. The metric must say undefined rather than return a number
+    that would be averaged into a table as if it meant something."""
     fish_clean, fish, water = _scene(noise_sigma=25.0)
-    r = texture_retention(fish, water, fish_clean, np.full_like(water, 120.0))
-    assert 0.8 < r < 1.2, f"got {r:.3f} at sigma 25"
+    assert np.isnan(texture_retention(fish, fish_clean))
 
 
 def test_retention_survives_a_brightness_mismatch_between_fish_and_water():
@@ -146,8 +192,8 @@ def test_retention_survives_a_brightness_mismatch_between_fish_and_water():
     fish_clean = 120 + _scales()
     fish = fish_clean + r.normal(0, 16.0, fish_clean.shape)           # bright, noisy
     water = np.full((128, 128), 40.0) + r.normal(0, 6.0, (128, 128))  # dark, quiet
-    identity = texture_retention(fish, water, fish, water)
-    perfect = texture_retention(fish, water, fish_clean, np.full_like(water, 40.0))
+    identity = texture_retention(fish, fish)
+    perfect = texture_retention(fish, fish_clean)
     assert 0.85 < identity < 1.15, f"identity read {identity:.3f}"
     assert 0.8 < perfect < 1.2, f"perfect denoiser read {perfect:.3f}"
 
@@ -156,7 +202,7 @@ def test_retention_on_a_textureless_fish_patch_is_reported_as_undefined():
     """No texture to retain means the ratio is 0/0. It must say so rather
     than return a number that will be averaged into a table."""
     _, _, water = _scene()
-    r = texture_retention(water, water, water, water)
+    r = texture_retention(water, water)
     assert np.isnan(r)
 
 

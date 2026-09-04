@@ -286,3 +286,25 @@ def test_fewer_levels_means_a_smaller_receptive_field():
 
 def test_default_levels_is_three():
     assert BlindSpotUNet(channels=4, base=8).levels == 3
+
+
+def test_checkpoints_from_before_the_depth_refactor_still_load():
+    """The first trained models were saved with layer names enc1..dec1.
+    Refactoring the class for a configurable depth must not orphan them --
+    it did once, and cost a re-measurement."""
+    legacy_names = {"encoders.0": "enc1", "encoders.1": "enc2", "encoders.2": "enc3",
+                    "ups.0": "up2", "decoders.0": "dec2", "ups.1": "up1", "decoders.1": "dec1"}
+    torch.manual_seed(3)
+    original = BlindSpotUNet(channels=4, base=8, levels=3)
+    legacy = {}
+    for k, v in original.state_dict().items():
+        head = ".".join(k.split(".")[:2]) if not k.startswith("out") else "out"
+        rest = k[len(head) + 1:] if head != "out" else k[len("out") + 1:]
+        legacy[f"{legacy_names.get(head, head)}.{rest}"] = v
+    assert any(k.startswith("enc1.") for k in legacy)
+    restored = BlindSpotUNet(channels=4, base=8, levels=3)
+    restored.load_state_dict(legacy)
+    x = _batch(b=1, c=4, h=32, w=32)
+    original.eval(); restored.eval()
+    with torch.no_grad():
+        assert torch.allclose(original(x), restored(x))
