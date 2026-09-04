@@ -247,3 +247,42 @@ def test_cross_plane_on_and_off_hit_similar_pixel_counts():
                            generator=torch.Generator().manual_seed(22),
                            cross_plane=False).float().mean().item()
     assert 0.5 < off / on < 2.0, f"rates differ too much: {on:.4f} vs {off:.4f}"
+
+
+# ---------------------------------------------------------------------------
+# Receptive field -- the structural lever on texture
+# ---------------------------------------------------------------------------
+
+def _footprint(net, size=96):
+    """Pixels of the output that a single input pixel can influence."""
+    net.eval()
+    with torch.no_grad():
+        x = torch.zeros(1, 4, size, size)
+        a = net(x)
+        x[0, 0, size // 2, size // 2] = 1.0
+        b = net(x)
+    changed = (a - b).abs().sum(dim=(0, 1)) > 1e-7
+    ys, xs = torch.nonzero(changed, as_tuple=True)
+    return int(ys.max() - ys.min() + 1) if len(ys) else 0
+
+
+@pytest.mark.parametrize("levels", [1, 2, 3])
+def test_unet_levels_preserve_shape(levels):
+    net = BlindSpotUNet(channels=4, base=8, levels=levels)
+    assert net(_batch(b=1, c=4, h=53, w=37)).shape == (1, 4, 53, 37)
+
+
+def test_fewer_levels_means_a_smaller_receptive_field():
+    """A blind-spot network suppresses whatever it cannot predict from its
+    context, and the larger its context, the more it can average across. A
+    net whose receptive field is a few scale periods can still see that scales
+    are periodic; one that sees the whole fish body can replace them with the
+    body's mean shade. Measured, not assumed: perturb one pixel, read the
+    output footprint."""
+    rf = {L: _footprint(BlindSpotUNet(channels=4, base=8, levels=L)) for L in (1, 2, 3)}
+    assert rf[1] < rf[2] < rf[3], rf
+    assert rf[1] <= 12, f"a one-level net should be a local filter, got {rf[1]} px"
+
+
+def test_default_levels_is_three():
+    assert BlindSpotUNet(channels=4, base=8).levels == 3

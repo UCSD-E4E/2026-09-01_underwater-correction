@@ -73,6 +73,9 @@ class N2VConfig:
     patch: int = 64
     batch: int = 32
     base: int = 32
+    #: U-Net depth; see `BlindSpotUNet`. Fewer levels, smaller receptive
+    #: field, less ability to average texture away.
+    levels: int = 3
     lr: float = 3e-4
     mask_rate: float = 0.02
     #: Blind-spot width along the correlated axis. Take this from
@@ -207,40 +210,58 @@ def _block(cin: int, cout: int) -> nn.Sequential:
 
 
 class BlindSpotUNet(nn.Module):
-    """A small three-level U-Net, 4 planes in and 4 out.
+    """A small U-Net, 4 planes in and 4 out, with a configurable depth.
 
     Deliberately small: the receptive field only has to cover the neighbourhood
     that predicts a pixel, and a larger model on this much data would start
     memorizing scene content rather than learning noise statistics. It also has
     to fit alongside 12-megapixel inference on a 6 GB card.
 
+    ``levels`` is the lever on texture. A blind-spot network suppresses
+    whatever it cannot predict from context, and the wider its context, the
+    more it can average across. Three levels see roughly 50 px of plane -- the
+    whole body of a labelled fish -- and can replace scale texture with the
+    body's mean shade, which is what the first model did (fish detail /4.6).
+    One level is a local filter of about 5 px; two sit between. Measured in
+    `test_fewer_levels_means_a_smaller_receptive_field`.
+
     Odd input sizes are padded internally and cropped back, so the output is
     exactly the input's shape -- production planes are 2007x1508, and padding
     that leaked to the caller would be a geometric change.
     """
 
-    def __init__(self, channels: int = 4, base: int = 32):
+    def __init__(self, channels: int = 4, base: int = 32, levels: int = 3):
         super().__init__()
-        self.enc1 = _block(channels, base)
-        self.enc2 = _block(base, base * 2)
-        self.enc3 = _block(base * 2, base * 4)
-        self.up2 = nn.ConvTranspose2d(base * 4, base * 2, 2, stride=2)
-        self.dec2 = _block(base * 4, base * 2)
-        self.up1 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)
-        self.dec1 = _block(base * 2, base)
-        self.out = nn.Conv2d(base, channels, 1)
+        if levels < 1:
+            raise ValueError("levels must be >= 1")
+        self.levels = levels
+        widths = [base * (2 ** i) for i in range(levels)]
+        self.encoders = nn.ModuleList(
+            [_block(channels, widths[0])]
+            + [_block(widths[i - 1], widths[i]) for i in range(1, levels)]
+        )
+        self.ups = nn.ModuleList(
+            [nn.ConvTranspose2d(widths[i], widths[i - 1], 2, stride=2) for i in range(levels - 1, 0, -1)]
+        )
+        self.decoders = nn.ModuleList(
+            [_block(widths[i - 1] * 2, widths[i - 1]) for i in range(levels - 1, 0, -1)]
+        )
+        self.out = nn.Conv2d(widths[0], channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, _, h, w = x.shape
-        ph, pw = (-h) % 4, (-w) % 4
+        multiple = 2 ** (self.levels - 1)
+        ph, pw = (-h) % multiple, (-w) % multiple
         if ph or pw:
             x = F.pad(x, (0, pw, 0, ph), mode="reflect")
-        e1 = self.enc1(x)
-        e2 = self.enc2(F.max_pool2d(e1, 2))
-        e3 = self.enc3(F.max_pool2d(e2, 2))
-        d2 = self.dec2(torch.cat([self.up2(e3), e2], dim=1))
-        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
-        return self.out(d1)[:, :, :h, :w]
+        skips = []
+        for i, enc in enumerate(self.encoders):
+            x = enc(x if i == 0 else F.max_pool2d(x, 2))
+            skips.append(x)
+        x = skips.pop()
+        for up, dec in zip(self.ups, self.decoders):
+            x = dec(torch.cat([up(x), skips.pop()], dim=1))
+        return self.out(x)[:, :, :h, :w]
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +290,7 @@ def train(planes: np.ndarray, config: N2VConfig | None = None, *, log=None) -> B
     if h < config.patch or w < config.patch:
         raise ValueError(f"patch {config.patch} does not fit in {h}x{w} planes")
 
-    model = BlindSpotUNet(channels=c, base=config.base).to(device)
+    model = BlindSpotUNet(channels=c, base=config.base, levels=config.levels).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     model.train()
 
