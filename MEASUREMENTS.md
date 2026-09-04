@@ -634,3 +634,54 @@ early returns suggest resolvable scales are rare (1 in ~40 frames).
 Cost: 173 s per 12-megapixel frame on 16 cores. Offline is fine; the
 production JPEG stage would need the "np" profile swapped for "lc" or a
 tiled/downscaled PSD path before this could sit inline.
+
+## Scale retention across 12 frames — two regimes, and neither method dominates
+
+A scan of 459 held-out large-fish candidates (head–tail ≥ 400 px) found 12
+whose baseline scale-band peak clears 6σ; resolvable scale texture is rare
+(1 in ~40). Scale retention and grain on those 12, plus dive 223:
+
+| | dive 223 (4.5 px lattice) | 12 scanned frames, mean (min–max) |
+|---|---:|---:|
+| N2V, random crops | **0.00** | 1.08 (0.13–1.84) |
+| N2V, fish crops | 0.00 | 1.24 (0.44–2.12) |
+| N2V, fish crops, 2-level | 0.00 | 1.02 (0.39–1.50) |
+| BM3D 0.5, L only | 0.87 | 0.69 (0.44–0.98) |
+| BM3D 0.5 + chroma | **0.86** | 0.69 (0.43–0.98) |
+| BM3D 1.0 + chroma | 0.75 | 0.57 (0.31–0.96) |
+
+**Regime 1 — fine reticulated lattice (dive 223, ~4.5 px).** N2V erases it
+entirely; BM3D keeps 86%. The lattice is 2.25 px in the photosite planes —
+at Nyquist — so this is structural for any per-plane method.
+
+**Regime 2 — coarse scales and body stripes (the 12, roughly 10–20 px).**
+N2V keeps them: ≥ 0.84 on 10 of 12, and at 1:1 the stripes on dive 116 are
+crisp with the water visibly cleaner than BM3D's. BM3D 0.5 keeps 0.43–0.98,
+losing most on the noisiest frames, where it works hardest. Above Nyquist
+the blind-spot network sees the periodicity and preserves it; BM3D's 8×8
+collaborative filtering favours sharp fine lattices over soft coarse
+modulation.
+
+Three caveats that bound how far these numbers carry:
+
+- **The metric's magnitudes on coarse oriented texture are not trustworthy.**
+  It was validated on a fine isotropic lattice and synthetic crossed
+  sinusoids. Dive 116 reads 0.43 for BM3D while the stripes are plainly
+  intact at 1:1, and N2V reads up to 2.12 — prominence over an envelope the
+  denoiser has lowered. Direction is right; magnitude is not. Radial averaging
+  dilutes an oriented peak by its angular share of the annulus.
+- **The scan's "scale peaks" are often body stripes**, not scales. What the
+  12 frames measure is coarse periodic body texture generally.
+- **BM3D's grain figures here are optimistic by ~1.4×**: the sweep processed
+  the water region on its own against its own PSD (the ideal case), while
+  N2V's are full-frame. On dive 223 the same choice read /5.34 against /3.67.
+
+**Recommendation.** The choice is set by scale pitch in output pixels, which
+is set by fish size and range. If scale-based identity needs lattices as fine
+as dive 223's, BM3D at half the measured PSD with chroma filtering is the
+only candidate that keeps them (0.86, shift 0.005–0.018 px, ~13 min/frame
+full-resolution, three channels). If identity works at ≥ 10 px pitch, the
+Bayer-domain N2V keeps those and cleans the water harder at 30 s/frame.
+Deciding which pitch identity needs is a question for the identity work, not
+for this harness — but it is now a *measurable* question, and the two arms
+are both in the tree with the metric that separates them.
