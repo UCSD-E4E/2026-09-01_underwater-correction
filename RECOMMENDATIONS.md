@@ -114,3 +114,23 @@ arm: 254 more frames of rendering, zero build work.
    detectors were deprioritised.
 3. **Dive-level quality vs labeling time.** The correlation job died with an
    earlier crash and was not re-run.
+
+## Denoising — held open, both arms retained (2026-09-03)
+
+Two denoisers are in the tree with opposite strengths on scale texture
+(MEASUREMENTS.md, "two regimes"). Bayer-domain Noise2Void keeps coarse scales
+and stripes and erases fine ~4.5 px lattices; full-resolution BM3D keeps the
+fine lattices and loses more of the coarse ones. Which matters depends on the
+scale pitch that fish identity will need, and that is not yet known.
+
+So neither is recommended for the archived JPEG. Two things are safe now:
+
+- **The raw is never modified.** Identity work can re-decode from the `.ORF`
+  with whichever arm the pitch question favours. Nothing done at the JPEG
+  stage forecloses it.
+- **The labeler trial can carry N2V as a third arm.** What labelers see and
+  what identity reads need not be the same decode; the trial measures the
+  labeler axis and does not decide the identity one.
+
+Revisit when the identity work can state a required scale pitch in output
+pixels. The metric to test against is `enhancement_eval/texture.py`.
