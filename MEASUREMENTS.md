@@ -544,3 +544,54 @@ row-readout noise: that would stay flat along the row, and this decays
 geometrically (0.162, 0.088, 0.050, 0.031, 0.016, 0.008), which is the analog
 readout chain's horizontal bandwidth limit. So the blind spot is a 5-wide
 horizontal line, from `recommended_mask_width`, not the paper's default point.
+
+## Scale texture — the number the fish-detail figure could not give
+
+Chris intends to identify individual fish from their scale patterns, so
+scale-level texture is a future *input*. The "fish detail" figure used above
+(high-frequency residual on the fish) could not say whether N2V had removed
+scales or grain — on a raw frame that residual is mostly grain, and a denoiser
+that erases both scores the same as one that erases only noise.
+
+`enhancement_eval/texture.py`, 21 tests. Looked at directly, scales are a
+**spectral peak**: the dive 223 angelfish flank's 2D spectrum is a crisp
+hexagonal lattice of six discrete peaks at ~4.5 px period, standing well above
+a smooth envelope; noise is the envelope. Texture is measured as the peak's
+prominence above the fish patch's own running-median envelope in the 3–24 px
+band, and retention is that after over before. Reported as undefined when the
+peak is under 6σ of the estimate's own sampling noise, rather than as a number
+that would be averaged into a table.
+
+Validated on the real 223 flank (peak 10.3σ): identity 1.00; added noise
+σ=8 → 0.90; Gaussian blur σ=0.5 → 0.69, σ=1.0 → 0.14, σ≥1.5 → 0.00. Graded,
+not brittle, and robust to noise.
+
+Three designs failed on real frames before this one, each caught by a number
+that could not have been right: an open-water floor subtraction read 1.16 and
+2.82 (texture *created* by denoising — shot noise scales with brightness, so
+water is the wrong floor level for a fish); unnormalized |FFT|² read a 320 px
+patch 4× above a 200 px one (every synthetic patch had been 128×128); and a
+guard comparing a narrow lattice to the *whole band's* envelope threw out the
+one frame with unmistakable scales.
+
+## Noise2Void erases scales, and the reason is geometric
+
+| dive 223 flank, scale retention | |
+|---|---:|
+| N2V, random crops (the model above) | **0.00** |
+| N2V, trained on fish-centred crops | **0.00** |
+| N2V, fish crops, two-level net (RF ~20 px) | **0.00** |
+
+Three models, three training choices, one answer. Teaching the network what
+scales look like did not help, and shrinking its receptive field did not help.
+That points at geometry, not training: the lattice's 4.5 px period in the
+output is **2.25 px in the half-resolution photosite planes** N2V operates on —
+at the plane's Nyquist limit. Measured on the raw planes, the lattice's
+strongest excess sits at 2.57 px in G1 and at 1.59 px, aliased, in R. A
+blind-spot network cannot separate that from pixel noise by construction.
+
+So the Bayer-domain N2V above stands as measured — 5.2× grain reduction, real
+help for head/tail on degraded frames — but it is disqualified for anything
+that needs fine scales. It could still keep coarser scales on larger, closer
+fish (a 15 px output period is 7.5 px in the plane); the scan for frames with
+resolvable scales (`scaled.csv`) is where that gets tested.
