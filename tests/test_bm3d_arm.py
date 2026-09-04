@@ -239,3 +239,33 @@ def test_psd_array_matches_scalar_sigma_on_white_noise():
     psd = noise_psd_from_water(r.normal(0, sigma, (256, 256)), size=64)
     ours = _bm3d.bm3d(z, sigma_psd=_psd_for_image(psd, z.shape), profile="np")
     assert np.abs(ours - ref).mean() < 0.01, f"mean abs diff {np.abs(ours - ref).mean():.4f}"
+
+
+# ---------------------------------------------------------------------------
+# The PSD region must be textureless -- the risk the fixture exposed
+# ---------------------------------------------------------------------------
+
+def test_textured_psd_region_raises_a_warning():
+    """When the lattice sat in the region the PSD is measured from, BM3D
+    treated the scales as noise and erased them frame-wide. Real open water
+    has no scales, but nothing guarantees the top-left fifth is open water on
+    every frame. The enhancer must say so rather than silently over-filter."""
+    from enhancement_eval.bm3d_arm import TexturedNoiseRegion
+
+    r = _rng(41)
+    h = w = 256
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    lattice = _scales(h, w)                       # everywhere, including top-left
+    base = np.stack([80 + lattice, 100 + lattice, 120 + lattice], axis=-1)
+    img = np.clip(base + r.normal(0, 6, base.shape), 0, 255).astype(np.uint8)
+    with pytest.warns(TexturedNoiseRegion):
+        bm3d_enhancer(BM3DConfig())(img)
+
+
+def test_clean_psd_region_does_not_warn():
+    import warnings
+    from enhancement_eval.bm3d_arm import TexturedNoiseRegion
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", TexturedNoiseRegion)
+        bm3d_enhancer(BM3DConfig())(_rgb_frame())

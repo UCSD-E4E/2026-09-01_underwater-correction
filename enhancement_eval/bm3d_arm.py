@@ -36,7 +36,23 @@ from dataclasses import dataclass
 
 import numpy as np
 
-__all__ = ["BM3DConfig", "bm3d_enhancer", "denoise_luminance", "noise_psd_from_water"]
+__all__ = [
+    "BM3DConfig", "TexturedNoiseRegion", "bm3d_enhancer", "denoise_luminance",
+    "noise_psd_from_water",
+]
+
+
+class TexturedNoiseRegion(UserWarning):
+    """The region the noise PSD is measured from carries real texture.
+
+    BM3D removes whatever the PSD says is noise. When the synthetic test
+    frame's scale lattice extended into the PSD region, the noise model
+    contained the scales and the filter erased them across the whole frame --
+    retention 0.000 against 226 sigma of input. The top-left fifth is open
+    water by convention, not by guarantee, so the enhancer checks the region
+    for a significant spectral peak and warns rather than over-filtering in
+    silence. The frame is still processed; the warning is the record.
+    """
 
 
 def _import_bm3d():
@@ -123,6 +139,20 @@ def denoise_luminance(
     return np.clip(np.asarray(out, dtype=np.float64) * 255.0, 0.0, 255.0)
 
 
+def _check_region_is_textureless(region: np.ndarray) -> None:
+    import warnings
+
+    from .texture import SIGNIFICANCE, texture_power
+
+    prominence, noise = texture_power(region)
+    if noise > 0 and prominence > SIGNIFICANCE * noise:
+        warnings.warn(
+            f"noise-PSD region has a {prominence / noise:.1f} sigma spectral peak in the "
+            f"scale band; BM3D will treat that texture as noise and remove it everywhere",
+            TexturedNoiseRegion, stacklevel=3,
+        )
+
+
 def bm3d_enhancer(config: BM3DConfig | None = None):
     """An `Enhancer`: uint8 RGB in, uint8 RGB out, L filtered, a and b kept.
 
@@ -139,6 +169,7 @@ def bm3d_enhancer(config: BM3DConfig | None = None):
         lum = lab[..., 0] * 2.55
         h, w = lum.shape
         region = np.s_[: max(h // 5, config.psd_size), : max(w // 5, config.psd_size)]
+        _check_region_is_textureless(lum[region])
         lab[..., 0] = denoise_luminance(lum, lum[region], config) / 2.55
         if config.chroma_strength > 0:
             # a and b live on roughly [-128, 128]; shift to [0, 255] for the
