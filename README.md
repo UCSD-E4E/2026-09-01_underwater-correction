@@ -292,6 +292,32 @@ Both directories are content-addressed, so files fetched by any means work and
 Budget roughly *n_images × n_arms × 15 s*. The three phases are separate so
 phase 3 re-runs for free.
 
+## Scripts, models and the repo-local package
+
+Everything that produces a number in MEASUREMENTS.md lives under version
+control. A reboot on 2026-09-03 cleared `/tmp` and took the first versions
+of all of this with the session scratchpad, along with five trained
+checkpoints; that is why none of it lives there any more.
+
+```
+scripts/frame_sets.py    regenerate every frame set from the database (seeded;
+                         data/frame_sets.json holds the ids to check against)
+scripts/train_n2v.py     train a Noise2Void model on photosite planes -> models/
+scripts/scan_scales.py   find held-out frames whose scale peak is measurable
+scripts/eval_scales.py   scale retention, grain, displacement for N2V models
+                         and BM3D variants against the shipped decode
+scripts/_common.py       the production JPEG chain and patch conventions
+models/                  trained checkpoints (~8 MB each; committed)
+data/                    frame lists and crops (ignored; ids are committed)
+.pylib/                  bm3d, installed repo-locally:
+                           uv pip install --python .venv/bin/python --target .pylib bm3d
+                           rm -rf .pylib/numpy* .pylib/scipy*   # the venv has them
+```
+
+Training is seeded, but CUDA convolutions are not bit-deterministic across
+runs, so a retrained checkpoint is equivalent to the one a recorded number
+came from, not identical.
+
 ## Tests
 
 ```
