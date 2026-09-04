@@ -103,27 +103,106 @@ def test_denoise_does_not_mutate_input():
 # As an enhancer in the harness
 # ---------------------------------------------------------------------------
 
-def _rgb_frame(h=160, w=160):
+FISH = np.s_[80:208, 80:208]
+
+
+def _rgb_frame(h=256, w=256):
+    """Colour gradients, open water in the top-left fifth, and a scale
+    lattice confined to a 'fish' region -- the same in every channel, so it
+    is luminance texture, which is what real scales are.
+
+    Two earlier versions of this fixture each taught something. One put the
+    lattice in blue alone, making it chroma texture that the chroma filter
+    then correctly removed. The other put the lattice everywhere, including
+    the top-left region the PSD is measured from -- so the noise model
+    contained the scales and BM3D erased them frame-wide (retention 0.000).
+    Real open water has no scales, but that is a genuine operational risk:
+    a PSD region that contains texture removes that texture everywhere.
+    """
     r = _rng(5)
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
-    base = np.stack([60 + 40 * xx / w, 90 + 30 * yy / h, 120 + _scales(h, w)], axis=-1)
+    lattice = np.zeros((h, w))
+    lattice[FISH] = _scales(128, 128)
+    base = np.stack([60 + 40 * xx / w + lattice, 90 + 30 * yy / h + lattice, 120 + lattice], axis=-1)
     return np.clip(base + r.normal(0, 8, base.shape), 0, 255).astype(np.uint8)
 
 
 def test_enhancer_preserves_shape_and_dtype():
     out = bm3d_enhancer(BM3DConfig())(_rgb_frame())
-    assert out.shape == (160, 160, 3) and out.dtype == np.uint8
+    assert out.shape == (256, 256, 3) and out.dtype == np.uint8
 
 
-def test_enhancer_leaves_colour_alone():
-    """Only L is filtered; a and b pass through, so hue -- which the species
-    and slate labels depend on -- is untouched."""
+def test_enhancer_keeps_luminance_scales_on_a_colour_frame():
+    """The end-to-end version of the claim: through rgb2lab, a PSD measured
+    from the frame's own open water, and back to uint8."""
+    from skimage.color import rgb2lab
+
+    img = _rgb_frame()
+    out = bm3d_enhancer(BM3DConfig())(img)
+    l_in = rgb2lab(img / 255.0)[..., 0][FISH] * 2.55
+    l_out = rgb2lab(out / 255.0)[..., 0][FISH] * 2.55
+    r = texture_retention(l_in, l_out)
+    assert r > 0.6, f"scale retention through the enhancer {r:.3f}"
+
+
+def test_enhancer_leaves_colour_alone_by_default():
+    """With chroma filtering off, a and b pass through, so hue -- which the
+    species and slate labels depend on -- is untouched."""
     from skimage.color import rgb2lab
 
     img = _rgb_frame()
     out = bm3d_enhancer(BM3DConfig())(img)
     a_in, a_out = rgb2lab(img / 255.0)[..., 1:], rgb2lab(out / 255.0)[..., 1:]
     assert np.abs(a_in - a_out).mean() < 1.5
+
+
+def _chroma_grain(rgb):
+    from scipy.ndimage import median_filter
+    from skimage.color import rgb2lab
+
+    ab = rgb2lab(rgb / 255.0)[..., 1:]
+    return float(np.mean([np.std(ab[..., i] - median_filter(ab[..., i], 3)) for i in range(2)]))
+
+
+def test_chroma_filtering_removes_colour_speckle():
+    """Scales are luminance texture, so a and b carry no scale information
+    and can be filtered hard. What remained after L-only filtering on dive
+    223 was a faint coloured mottle in the water and rock."""
+    img = _rgb_frame()
+    off = bm3d_enhancer(BM3DConfig(chroma_strength=0.0))(img)
+    on = bm3d_enhancer(BM3DConfig(chroma_strength=1.0))(img)
+    assert _chroma_grain(on) < 0.5 * _chroma_grain(off)
+
+
+def test_chroma_filtering_keeps_the_mean_colour():
+    """Speckle goes, hue stays: the local mean of a and b must not move, or
+    species and slate colours would drift."""
+    from scipy.ndimage import uniform_filter
+    from skimage.color import rgb2lab
+
+    img = _rgb_frame()
+    out = bm3d_enhancer(BM3DConfig(chroma_strength=1.0))(img)
+    ab_in, ab_out = rgb2lab(img / 255.0)[..., 1:], rgb2lab(out / 255.0)[..., 1:]
+    for i in range(2):
+        assert np.abs(uniform_filter(ab_in[..., i], 15) - uniform_filter(ab_out[..., i], 15)).mean() < 1.0
+
+
+def test_chroma_filtering_does_not_touch_luminance_scales():
+    from skimage.color import rgb2lab
+
+    img = _rgb_frame()
+    l_in = rgb2lab(img / 255.0)[..., 0][FISH] * 2.55
+    l_off = rgb2lab(bm3d_enhancer(BM3DConfig(chroma_strength=0.0))(img) / 255.0)[..., 0][FISH] * 2.55
+    l_on = rgb2lab(bm3d_enhancer(BM3DConfig(chroma_strength=1.0))(img) / 255.0)[..., 0][FISH] * 2.55
+    r_off, r_on = texture_retention(l_in, l_off), texture_retention(l_in, l_on)
+    assert abs(r_on - r_off) < 0.1, f"chroma filtering changed L retention {r_off:.3f} -> {r_on:.3f}"
+
+
+def test_chroma_filtering_does_not_move_pixels():
+    from enhancement_eval.contract import MAX_DISPLACEMENT_PX, probe_geometry
+
+    result = probe_geometry(bm3d_enhancer(BM3DConfig(chroma_strength=1.0)), name="bm3d+chroma")
+    assert result.displacement_px < MAX_DISPLACEMENT_PX, result
 
 
 def test_enhancer_does_not_move_pixels():

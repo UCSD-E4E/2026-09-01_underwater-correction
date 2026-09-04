@@ -58,6 +58,13 @@ class BM3DConfig:
     psd_size: int = 64
     strength: float = 1.0
     profile: str = "np"
+    #: PSD multiplier for the a and b channels; 0 leaves them untouched.
+    #: Scales are luminance texture, so chroma can be filtered far harder than
+    #: L without touching them -- and what L-only filtering left on dive 223
+    #: was a faint coloured mottle in water and rock. Only the speckle goes:
+    #: the local mean of a and b, which is the hue the species and slate
+    #: labels read, is preserved (tested).
+    chroma_strength: float = 0.0
 
 
 def noise_psd_from_water(water: np.ndarray, size: int = 64) -> np.ndarray:
@@ -131,8 +138,17 @@ def bm3d_enhancer(config: BM3DConfig | None = None):
         lab = rgb2lab(rgb.astype(np.float64) / 255.0)
         lum = lab[..., 0] * 2.55
         h, w = lum.shape
-        water = lum[: max(h // 5, config.psd_size), : max(w // 5, config.psd_size)]
-        lab[..., 0] = denoise_luminance(lum, water, config) / 2.55
+        region = np.s_[: max(h // 5, config.psd_size), : max(w // 5, config.psd_size)]
+        lab[..., 0] = denoise_luminance(lum, lum[region], config) / 2.55
+        if config.chroma_strength > 0:
+            # a and b live on roughly [-128, 128]; shift to [0, 255] for the
+            # same [0, 1] range the L path uses, and take each channel's own
+            # PSD from the same open-water region.
+            chroma_config = BM3DConfig(psd_size=config.psd_size, strength=config.chroma_strength,
+                                       profile=config.profile)
+            for c in (1, 2):
+                chan = lab[..., c] + 128.0
+                lab[..., c] = denoise_luminance(chan, chan[region], chroma_config) - 128.0
         out = np.clip(lab2rgb(lab) * 255.0, 0, 255)
         return np.rint(out).astype(np.uint8)
 
